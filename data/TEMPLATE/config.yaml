@@ -1,0 +1,56 @@
+# Copy this directory to data/<property_code>/, rename this file's parent, and fill in.
+# Do NOT put this file's parent directory name as "TEMPLATE" for a real property —
+# discover_properties() explicitly skips a directory named TEMPLATE.
+
+property_code: TEMPLATE                     # matches the parent directory name
+property_name: ""                           # legal owning entity, e.g. "Example Owner, LLC"
+property_display_name: ""                   # short name shown in the UI
+property_address: ""
+property_type: ""                           # e.g. Office, Life Science, Industrial
+market: ""
+submarket: ""
+state: ""
+management_company: Greatland Realty Partners
+active: true
+
+# Path to the quarterly distribution workbook, relative to data/<property_code>/.
+source_workbook_path_hint: source_files/distribution_workbook.xlsx
+
+# Logical name -> actual tab name in that workbook. Tab names drift between quarters
+# (e.g. "2026Budget" vs "2026 Budget") — always add an entry here rather than
+# hardcoding a tab name in parser code.
+sheet_map:
+  cash_flow: "Cash Flow"
+  equity_lp: "Equity - LP"
+  equity_bhc: "Equity - BHC"          # remove/rename if there's no second capital partner
+  debt: "Loan Interest"
+  waterfall_property: "Distribution Recommendation"
+  waterfall_cogp: "Distribution Recommendation BHC"   # remove if there's no nested co-GP tier
+  budget_current: "Budget"
+
+# Ownership/JV structure. One OwnershipTier per distributing entity. A single-tier
+# property (no co-GP split) just has one tier with parent_tier: null and every
+# investor's sub_tier: null.
+ownership_tiers:
+  - tier_id: property
+    distributing_entity: ""
+    parent_tier: null
+    display_label: LP/GP    # shown as this tier's tab label in the Distribution Waterfall
+    investors:
+      - display_name: ""
+        legal_entity: ""
+        ownership_pct: 0.0
+        role: LP
+        sub_tier: null
+
+# Loan tranches — abstract_file is populated once tools/extract_loan_abstract.py
+# has been run against the real loan document; leave blank until then.
+loans:
+  - tranche_name: ""
+    lender: ""
+    abstract_file: ""
+
+# JV agreements — same abstract-once pattern as loans.
+jv_documents:
+  - name: ""
+    abstract_file: ""

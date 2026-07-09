@@ -1,0 +1,89 @@
+property_code: revlabspm
+property_name: Revolution Labs Owner, LLC
+property_display_name: Revolution Labs
+property_address: 1050 Waltham Street, Lexington, MA
+property_type: Life Science
+market: Boston
+submarket: Route 128 / Lexington
+state: MA
+management_company: Greatland Realty Partners
+active: true
+
+source_workbook_path_hint: source_files/distribution_workbook.xlsx
+
+# Real Yardi/source-system codes for this property — used to filter multi-entity
+# exports (e.g. a trial balance covering several properties) down to just this one.
+# Confirmed 2026-07-09: dashboard's own "revlabspm" folder name doesn't match any of
+# these, so entity matching must go through yardi_codes, never property_code.
+yardi_codes:
+  - revlabpm
+  - revlabvn
+  - bh1050jv
+
+# "2026 Budget" (with space) chosen as canonical over "2026Budget" — wider column
+# range (AF vs S) suggests it's the more complete/current version. Revisit if Ryan
+# says otherwise.
+sheet_map:
+  cash_flow: "Cash Flow"
+  equity_lp: "Equity - LP"
+  equity_bhc: "Equity - BHC"
+  debt: "Rev Labs Interest"
+  waterfall_property: "Distribution Recommendation"
+  waterfall_cogp: "Distribution Recommendation BHC"
+  budget_current: "2026 Budget"
+
+# Two-tier JV: property level (SRE 90% LP / BH GRP 1050 Waltham 10% co-GP), and the
+# co-GP's own internal 50/50 split between Breed's Hill and GRP 1050 Waltham.
+ownership_tiers:
+  - tier_id: property
+    distributing_entity: Revolution Labs Venture, LLC
+    parent_tier: null
+    display_label: LP/GP
+    investors:
+      - display_name: SRE Fund III
+        legal_entity: SREOF III Holdings, LLC
+        ownership_pct: 0.90
+        role: LP
+        sub_tier: null
+      - display_name: BH GRP 1050 Waltham
+        legal_entity: BH GRP 1050 Waltham JV LLC
+        ownership_pct: 0.10
+        role: co-GP
+        sub_tier: bhgrp
+
+  - tier_id: bhgrp
+    distributing_entity: BH GRP 1050 Waltham JV LLC
+    parent_tier: property
+    display_label: Co-GP
+    investors:
+      - display_name: Breed's Hill Capital
+        legal_entity: 1040 Waltham Street LLC
+        ownership_pct: 0.50
+        role: co-GP member
+        is_greatland_affiliate: false
+        sub_tier: null
+      - display_name: GRP 1050 Waltham
+        legal_entity: GRP 1050 Waltham Member LLC
+        ownership_pct: 0.50
+        role: co-GP member
+        is_greatland_affiliate: true
+        sub_tier: null
+
+# Populate abstract_file for each once a real loan document is run through
+# tools/extract_loan_abstract.py — left blank in v1 (no abstracts generated yet).
+loans:
+  - tranche_name: Note A
+    lender: ""
+    abstract_file: ""
+  - tranche_name: Note B
+    lender: ""
+    abstract_file: ""
+  - tranche_name: Mezz
+    lender: ""
+    abstract_file: ""
+
+jv_documents:
+  - name: Revolution Labs Venture JV Agreement
+    abstract_file: ""
+  - name: BH GRP 1050 Waltham Operating Agreement
+    abstract_file: ""

@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# Sensitive financial source files — never commit
+data/*/source_files/
+data/*/abstracts/
+*.xlsx
+*.xls
+*.pdf
+
+# Explicitly re-allow non-sensitive committed files
+!data/TEMPLATE/config.yaml
+!data/*/config.yaml
+!requirements.txt
+
+# Secrets / env
+.env
+*.env
+.streamlit/secrets.toml
