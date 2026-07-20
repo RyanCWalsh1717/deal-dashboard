@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets"
 
@@ -148,4 +148,61 @@ def render_hero(title: str, subtitle: str = "", badges: Optional[List[str]] = No
 """,
         height=150,
         scrolling=False,
+    )
+
+
+def render_kpi_tiles(metrics: List[Tuple[str, str, Optional[str]]]) -> None:
+    """GRP-branded KPI tiles — Ryan's chosen style from the 3-way comparison
+    (2026-07-10): light-green tiles with a dark-green left accent bar, matching
+    the hero banner's palette. `metrics` is a list of (label, value, optional
+    sub-caption) tuples, rendered as a responsive row of equal-width tiles.
+    """
+    import streamlit as st
+
+    tiles_html = ""
+    for label, value, sub in metrics:
+        sub_html = f'<div class="grp-tile-sub">{sub}</div>' if sub else ""
+        tiles_html += f"""
+        <div class="grp-tile">
+          <div class="grp-tile-label">{label}</div>
+          <div class="grp-tile-value">{value}</div>
+          {sub_html}
+        </div>"""
+
+    st.markdown(
+        f"""
+        <style>
+          .grp-tile-row {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 0.5rem; }}
+          .grp-tile {{
+            background: #E8F5E9;
+            border: 1px solid #A5D6A7;
+            border-left: 4px solid #1A5C22;
+            border-radius: 8px;
+            padding: 14px 18px;
+            flex: 1;
+            min-width: 150px;
+          }}
+          .grp-tile-label {{
+            font-size: 0.78rem;
+            color: #2E7D32;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 4px;
+          }}
+          .grp-tile-value {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #1A5C22;
+            line-height: 1.2;
+          }}
+          .grp-tile-sub {{
+            font-size: 0.72rem;
+            color: #558B2F;
+            margin-top: 4px;
+          }}
+        </style>
+        <div class="grp-tile-row">{tiles_html}</div>
+        """,
+        unsafe_allow_html=True,
     )

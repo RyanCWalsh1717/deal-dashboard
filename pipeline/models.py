@@ -61,6 +61,14 @@ class CashFlowResult:
 
 
 @dataclass
+class BalanceSheetLine:
+    account_code: str
+    label: str
+    value: Optional[float] = None
+    indent: int = 0
+
+
+@dataclass
 class EquityPosition:
     entity_name: str
     entity_code: str = ""
@@ -68,6 +76,7 @@ class EquityPosition:
     balance_sheet: Dict[str, float] = field(default_factory=dict)
     contributions_by_partner: Dict[str, float] = field(default_factory=dict)
     distributions_by_partner: Dict[str, float] = field(default_factory=dict)
+    balance_sheet_lines: List[BalanceSheetLine] = field(default_factory=list)
 
     def _total(self, *needles: str) -> Optional[float]:
         for key, value in self.balance_sheet.items():

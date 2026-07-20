@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 from openpyxl.worksheet.worksheet import Worksheet
 
-from pipeline.models import EquityPosition
+from pipeline.models import BalanceSheetLine, EquityPosition
 
 _HEADER_RE = re.compile(r"^(?P<name>.*?)\s*\((?P<code>[^)]+)\)\s*$")
 
@@ -51,15 +51,36 @@ def parse_equity_tab(
     balance_sheet = {}
     contributions_by_partner = {}
     distributions_by_partner = {}
+    balance_sheet_lines = []
 
     scan_max = min(ws.max_row, max_row)
     for r in range(1, scan_max + 1):
-        label = ws.cell(row=r, column=label_col).value
+        raw_label = ws.cell(row=r, column=label_col).value
         value = ws.cell(row=r, column=value_col).value
-        if not isinstance(label, str) or value is None or not isinstance(value, (int, float)):
+        if not isinstance(raw_label, str):
             continue
-        clean = label.strip()
+        clean = raw_label.strip()
         if not clean:
+            continue
+
+        # Balance-sheet outline: every row down to category/total level, keyed
+        # by indentation (raw leading-space count). The deeper "Investor" /
+        # per-investor-name breakdown rows (indent 7+) are excluded here —
+        # that detail belongs to contributions_by_partner/distributions_by_partner
+        # below, not a generic balance sheet line.
+        indent = len(raw_label) - len(raw_label.lstrip(" "))
+        if indent <= 6:
+            code = ws.cell(row=r, column=1).value
+            balance_sheet_lines.append(
+                BalanceSheetLine(
+                    account_code=str(code) if code is not None else "",
+                    label=clean,
+                    value=float(value) if isinstance(value, (int, float)) else None,
+                    indent=indent,
+                )
+            )
+
+        if value is None or not isinstance(value, (int, float)):
             continue
 
         upper = clean.upper()
@@ -81,4 +102,5 @@ def parse_equity_tab(
         balance_sheet=balance_sheet,
         contributions_by_partner=contributions_by_partner,
         distributions_by_partner=distributions_by_partner,
+        balance_sheet_lines=balance_sheet_lines,
     )
