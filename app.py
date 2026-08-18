@@ -15,8 +15,8 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from pipeline import source_files
-from pipeline.models import PortfolioSummaryRow
-from pipeline.parsers.budget_comparison_report import parse_budget_comparison_report
+from pipeline.models import BudgetLine, PortfolioSummaryRow
+from pipeline.parsers.budget_comparison_report import parse_annual_budget_totals, parse_budget_comparison_report
 from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.distribution_workbook import parse_workbook
 from pipeline.parsers.rent_roll import parse_rent_roll
@@ -114,6 +114,15 @@ def _cached_budget_comparison_report(path_str: str, mtime: float, property_code:
     wb = openpyxl.load_workbook(path_str, data_only=True)
     ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
     return parse_budget_comparison_report(ws, property_code)
+
+
+@st.cache_data(show_spinner="Parsing budget comparison report...")
+def _cached_annual_budget_totals(path_str: str, mtime: float):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path_str, data_only=True)
+    ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    return parse_annual_budget_totals(ws)
 
 
 def _resolve_budget_comparison_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[Optional[Path], Optional[float]]:
@@ -280,6 +289,18 @@ def main() -> None:
                 bc_result = _cached_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
                 if bc_result.lines:
                     result.budget_comparison = bc_result
+
+                annual_totals = _cached_annual_budget_totals(str(bc_path), bc_mtime)
+                if len(annual_totals) == 8 and result.annual_budget_summary:
+                    result.annual_budget_summary.lines = [
+                        BudgetLine(
+                            account_code=line.account_code,
+                            account_label=line.account_label,
+                            budget_value=annual_totals.get(line.account_code, line.budget_value),
+                            actual_value=line.actual_value,
+                        )
+                        for line in result.annual_budget_summary.lines
+                    ]
             except Exception as exc:
                 st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
 

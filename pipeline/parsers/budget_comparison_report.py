@@ -59,6 +59,67 @@ def parse_period(ws: Worksheet) -> Optional[date]:
     return None
 
 
+_ANNUAL_COL = 11
+
+# Maps our internal Annual Budget row keys to this report's own subtotal
+# labels (column 2) — these are the rows parse_budget_comparison_report()
+# deliberately excludes (label starts with "TOTAL"/is a rollup), but they're
+# exactly the P&L waterfall the Annual Budget section needs. Confirmed
+# directly against Budget_Comparison_Accrual (31).xlsx: this report's own
+# "NET INCOME" row mathematically equals NOI minus Debt Service — i.e. our
+# model's "Cash Flow after Debt Service", a different concept from the
+# distribution workbook's trailing-12-month Net Income (already excluded
+# from this section for that reason) — nothing labeled "Net Income" is ever
+# shown to the user from this mapping.
+_ANNUAL_ROW_LABELS = {
+    "revenue": "TOTAL REVENUE",
+    "expenses": "TOTAL EXPENSES",
+    "non_operating_expenses": "TOTAL OPERATING EXPENSES - NON RECOVERABLE",
+    "noi": "NET OPERATING INCOME",
+    "debt_service": "TOTAL INTEREST EXPENSE & FEES",
+    "cash_flow_after_debt_service": "NET INCOME",
+}
+# Capital Expenditures has no row of its own — it's the balance-sheet asset
+# movement for the year, sign-flipped (an asset increase is a debit/negative
+# in this report's convention). "CASH FLOW" is the bottom line, in column 2
+# on a row with a blank column 1 (same as the other totals here).
+_CAPEX_LABEL = "TOTAL ASSETS"
+_CASH_FLOW_AFTER_CAPEX_LABEL = "CASH FLOW"
+
+
+def _find_label_value(ws: Worksheet, label: str, col: int = _LABEL_COL) -> Optional[float]:
+    needle = label.strip().upper()
+    for r in range(1, ws.max_row + 1):
+        cell = ws.cell(row=r, column=col).value
+        if isinstance(cell, str) and cell.strip().upper() == needle:
+            value = ws.cell(row=r, column=_ANNUAL_COL).value
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
+def parse_annual_budget_totals(ws: Worksheet) -> dict:
+    """Reads the Annual-column value off each labeled subtotal row in
+    _ANNUAL_ROW_LABELS, plus Capital Expenditures and Cash Flow after
+    Capital Expenditures. Returns whatever subset of the 8 keys it finds —
+    callers decide what to do with a partial result."""
+    totals = {}
+    for key, label in _ANNUAL_ROW_LABELS.items():
+        value = _find_label_value(ws, label)
+        if value is not None:
+            totals[key] = value
+
+    capex = _find_label_value(ws, _CAPEX_LABEL)
+    if capex is not None:
+        totals["capital_expenditures"] = -capex
+
+    cash_flow_after_capex = _find_label_value(ws, _CASH_FLOW_AFTER_CAPEX_LABEL)
+    if cash_flow_after_capex is not None:
+        totals["cash_flow_after_capital_expenditures"] = cash_flow_after_capex
+
+    return totals
+
+
 def parse_budget_comparison_report(ws: Worksheet, property_code: str) -> BudgetComparisonResult:
     period = parse_period(ws)
     lines = []
