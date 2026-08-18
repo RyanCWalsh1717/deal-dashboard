@@ -152,14 +152,20 @@ def build_pnl_summary(
     nonop_b = budget.subtotal("Total Operating Expenses - Unrecoverable", period)
 
     noi_a = actual.subtotal("Net Operating Income/(Loss)", period)
-    noi_b = _sub_optional(revenue_b, expenses_b)
+    # NOI = Revenue - Recoverable OpEx - Unrecoverable OpEx, confirmed against
+    # Ryan's own Kardin budget-comparison report (2026-07-15): its boxed NOI
+    # ties out exactly to Total Income minus BOTH OpEx subtotals, not just the
+    # recoverable one.
+    noi_b = _sub_optional(revenue_b, expenses_b, nonop_b)
 
     debt_a = actual.subtotal("Total Interest Expense & Fees", period)
     debt_b = budget.subtotal("Total Debt Service", period)
 
     capex_b = budget.subtotal("Total Capital Expenditures", period)
     cf_after_a = actual.subtotal("Cash Flow after Capital Expenditures", period)
-    cf_after_b = _sub_optional(noi_b, nonop_b, debt_b, capex_b)
+    # nonop_b is already folded into noi_b above — subtracting it again here
+    # would double-count it.
+    cf_after_b = _sub_optional(noi_b, debt_b, capex_b)
 
     # Confirmed 2026-07-09: the Cash Flow tab's "Net Income" row is a
     # trailing-12-month figure that only extends through the last actual
@@ -182,6 +188,73 @@ def build_pnl_summary(
         for code, label, b, a in rows
     ]
     return BudgetComparisonResult(property_code=property_code, period=period, lines=lines)
+
+
+def _sum_subtotal(result: CashFlowResult, label: str, periods) -> Optional[float]:
+    values = [result.subtotal(label, p) for p in periods]
+    values = [v for v in values if v is not None]
+    return sum(values) if values else None
+
+
+def build_annual_pnl_summary(
+    actual: CashFlowResult, budget: CashFlowResult, ytd_through: date, property_code: str
+) -> BudgetComparisonResult:
+    """Full-year rollup: Annual Budget (sum of all 12 months' budget
+    subtotals for `ytd_through`'s year) vs. YTD Actual (sum of actual
+    subtotals from January through `ytd_through`, the last actual period).
+
+    Same shape as build_pnl_summary(), but summed across months instead of
+    reading a single period — plus two rows the monthly view doesn't carry
+    (Capital Expenditures, Cash Flow after Debt Service). On the actual
+    (Cash Flow tab) side, both of those are exact-match subtotal labels and
+    read directly. On the budget side, the label text is there too but sits
+    one column further right than `find_label_near()` reaches for this tab
+    — rather than widen that shared scan (used by every other parser call
+    too, and risking picking up an unintended column elsewhere), both are
+    derived here the same safe way build_pnl_summary() already derives its
+    combined "Cash Flow after Debt and Capital" row. Net Income is
+    intentionally left out — it's a trailing-12-month actual-only figure
+    (see build_pnl_summary), a different concept from a
+    Jan-through-`ytd_through` sum, and doesn't appear in Ryan's own Kardin
+    budget-comparison report either."""
+    annual_periods = [p for p in budget.period_columns if p.year == ytd_through.year]
+    ytd_periods = [p for p in actual.period_columns if p.year == ytd_through.year and p <= ytd_through]
+
+    def a(label: str) -> Optional[float]:
+        return _sum_subtotal(actual, label, ytd_periods)
+
+    def b(label: str) -> Optional[float]:
+        return _sum_subtotal(budget, label, annual_periods)
+
+    revenue_a, revenue_b = a("Total Income"), b("Total Income")
+    expenses_a = a("Total Operating Expenses")
+    expenses_b = _sum_optional(b("Total Operating Expenses - Recoverable"), b("Total Operating Expenses - Non-Recoverable"))
+    nonop_a, nonop_b = a("Total Operating Expenses - Unrecoverable"), b("Total Operating Expenses - Unrecoverable")
+    # NOI = Revenue - Recoverable OpEx - Unrecoverable OpEx — see the same
+    # fix/comment in build_pnl_summary().
+    noi_a, noi_b = a("Net Operating Income/(Loss)"), _sub_optional(revenue_b, expenses_b, nonop_b)
+    debt_a, debt_b = a("Total Interest Expense & Fees"), b("Total Debt Service")
+    cf_after_debt_a = a("Cash Flow after Debt Service")
+    cf_after_debt_b = _sub_optional(noi_b, debt_b)
+    capex_a, capex_b = a("Total Capital Expenditures"), b("Total Capital Expenditures")
+    cf_after_capex_a = a("Cash Flow after Capital Expenditures")
+    cf_after_capex_b = _sub_optional(cf_after_debt_b, capex_b)
+
+    rows = [
+        ("revenue", "Revenue", revenue_b, revenue_a),
+        ("expenses", "Expenses", expenses_b, expenses_a),
+        ("non_operating_expenses", "Non-operating Expenses", nonop_b, nonop_a),
+        ("noi", "NOI", noi_b, noi_a),
+        ("debt_service", "Debt Service", debt_b, debt_a),
+        ("cash_flow_after_debt_service", "Cash Flow after Debt Service", cf_after_debt_b, cf_after_debt_a),
+        ("capital_expenditures", "Capital Expenditures", capex_b, capex_a),
+        ("cash_flow_after_capital_expenditures", "Cash Flow after Capital Expenditures", cf_after_capex_b, cf_after_capex_a),
+    ]
+    lines = [
+        BudgetLine(account_code=code, account_label=label, budget_value=b_val, actual_value=a_val)
+        for code, label, b_val, a_val in rows
+    ]
+    return BudgetComparisonResult(property_code=property_code, period=ytd_through, lines=lines)
 
 
 def parse_budget_comparison(

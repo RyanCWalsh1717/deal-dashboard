@@ -22,7 +22,7 @@ from typing import List, Optional
 import openpyxl
 
 from pipeline.parsers._shared import parse_as_of_date
-from pipeline.parsers.cash_accounts import parse_loan_statement, parse_trial_balance_cash_accounts
+from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.rent_roll import parse_rent_roll
 from pipeline.parsers.waterfall import parse_distribution_waterfall
 from pipeline.property_config import PropertyConfig
@@ -31,7 +31,6 @@ _PERIOD_RE = re.compile(r"^\d{4}-\d{2}$")
 
 _CANONICAL_NAMES = {
     "distribution_workbook": "distribution_workbook.xlsx",
-    "trial_balance": "trial_balance.xlsx",
     "rent_roll": "rent_roll.xlsx",
 }
 
@@ -41,6 +40,7 @@ class ClassifiedUpload:
     file_type: str  # "distribution_workbook" | "trial_balance" | "rent_roll" | "loan_statement" | "unknown"
     period: Optional[str] = None  # "YYYY-MM"
     tranche_name: Optional[str] = None  # loan_statement only
+    entity_code: Optional[str] = None  # trial_balance only — one TB per entity, several possible per period
     error: Optional[str] = None
 
 
@@ -110,12 +110,13 @@ def classify_upload(data: bytes, filename: str, cfg: PropertyConfig) -> Classifi
             else f'"{filename}" looks like a rent roll, but no "As of Date:" label was found.',
         )
 
-    tb_accounts = parse_trial_balance_cash_accounts(io.BytesIO(data), cfg.yardi_codes)
-    if tb_accounts:
-        as_of = tb_accounts[0].as_of
+    tb_entities = parse_entity_trial_balance(io.BytesIO(data), cfg.yardi_codes)
+    if tb_entities:
+        as_of = tb_entities[0].as_of
         return ClassifiedUpload(
             file_type="trial_balance",
             period=_to_period(as_of),
+            entity_code=tb_entities[0].entity_code,
             error=None
             if as_of
             else f'"{filename}" looks like a trial balance, but no "Period = <Month Year>" label was found.',
@@ -135,6 +136,12 @@ def save_classified_upload(
     period_dir = Path(data_dir) / cfg.property_code / "source_files" / classified.period
     if classified.file_type == "loan_statement":
         target = period_dir / "loan_statements" / f"{_slugify(classified.tranche_name or 'tranche')}.pdf"
+    elif classified.file_type == "trial_balance":
+        # One TB file per entity per period — named by entity code (from the
+        # file's own "Property = <code>" header) rather than a single fixed
+        # name, since multiple entities' trial balances can coexist in the
+        # same period (property, venture, co-GP, ...).
+        target = period_dir / f"trial_balance_{_slugify(classified.entity_code or 'entity')}.xlsx"
     else:
         target = period_dir / _CANONICAL_NAMES[classified.file_type]
 
@@ -178,4 +185,21 @@ def resolve_period_loan_statements(cfg: PropertyConfig, period: str, data_dir: s
             pdfs = sorted(candidate_dir.glob("*.pdf"))
             if pdfs:
                 return pdfs
+    return []
+
+
+def resolve_period_trial_balances(cfg: PropertyConfig, period: str, data_dir: str = "data") -> List[Path]:
+    """Carry-forward lookup over every `trial_balance_*.xlsx` file (one per
+    entity — property, venture, co-GP, ...) in the nearest period at or
+    before `period` that has any, same shape as
+    resolve_period_loan_statements()."""
+    base = Path(data_dir) / cfg.property_code / "source_files"
+    for candidate_period in list_periods(cfg, data_dir):
+        if candidate_period > period:
+            continue
+        candidate_dir = base / candidate_period
+        if candidate_dir.exists():
+            files = sorted(candidate_dir.glob("trial_balance_*.xlsx"))
+            if files:
+                return files
     return []

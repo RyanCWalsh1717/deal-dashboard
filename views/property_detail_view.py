@@ -15,6 +15,7 @@ import streamlit as st
 from pipeline.models import (
     CashAccountBalance,
     DistributionWorkbookResult,
+    EntityTrialBalance,
     LoanStatement,
     RentRollResult,
     WaterfallTier,
@@ -66,14 +67,64 @@ def _total_cash(result: Optional[DistributionWorkbookResult]) -> Optional[float]
     return sum(values) if values else None
 
 
+def _cash_boxes(
+    result: Optional[DistributionWorkbookResult], cash_accounts: List[CashAccountBalance]
+) -> List[tuple]:
+    """Every individual cash-bearing account the app currently has data for,
+    across every entity level: JV/venture operating cash from the equity
+    tabs, plus trial-balance/loan-statement-derived development cash and
+    escrows/reserves (which live at the property-entity level and are a
+    materially different, non-overlapping pool of money). Deduped by
+    (entity_code, label) rather than label alone — once multiple entities'
+    trial balances are loaded, two different entities can legitimately both
+    have a "Cash - Operating" line, and deduping on label only would wrongly
+    collapse them into one."""
+    boxes = [("Operating Cash (all entities)", _total_cash(result), "equity_tabs")]
+    seen = {("", boxes[0][0])}
+    for acct in cash_accounts:
+        key = (acct.entity_code, acct.label)
+        if key in seen:
+            continue
+        seen.add(key)
+        boxes.append((acct.label, acct.balance, acct.source))
+    return boxes
+
+
+def _total_cash_all_sources(
+    result: Optional[DistributionWorkbookResult], cash_accounts: List[CashAccountBalance]
+) -> Optional[float]:
+    values = [v for _, v, _ in _cash_boxes(result, cash_accounts) if v is not None]
+    return sum(values) if values else None
+
+
+def _current_debt(
+    result: Optional[DistributionWorkbookResult], loan_statements: List[LoanStatement]
+) -> tuple:
+    """Prefers actual lender-statement balances over the distribution
+    workbook's pre-paydown forecast, since the two can diverge materially
+    (confirmed: forecast assumes a paydown that hadn't posted yet) — returns
+    (total_outstanding, source_label) so callers can show which one they got."""
+    if loan_statements:
+        total = sum(s.principal_balance or 0 for s in loan_statements)
+        as_of_dates = {s.as_of for s in loan_statements if s.as_of}
+        sub = f"actual, as of {max(as_of_dates)}" if as_of_dates else "actual, per lender"
+        return total, sub
+    if result and result.debt and result.debt.tranches:
+        return result.debt.total_outstanding, "forecast (distribution workbook)"
+    return None, None
+
+
 SECTIONS = [
     "Summary",
     "Cash",
     "Equity & Capital",
     "Balance Sheet",
+    "Rent Roll",
     "Debt & Loans",
+    "Reconciliation",
     "Distribution Waterfall",
     "Budget vs. Actuals",
+    "Annual Budget",
     "Sources & Uses",
     "Leasing & Investment Outlook",
 ]
@@ -98,9 +149,11 @@ def render_property_detail(
     cash_accounts: Optional[List[CashAccountBalance]] = None,
     rent_roll: Optional[RentRollResult] = None,
     loan_statements: Optional[List[LoanStatement]] = None,
+    entity_trial_balances: Optional[List[EntityTrialBalance]] = None,
 ) -> None:
     cash_accounts = cash_accounts or []
     loan_statements = loan_statements or []
+    entity_trial_balances = entity_trial_balances or []
 
     badges = [b for b in [cfg.market, cfg.property_type] if b]
     render_hero(cfg.display(), cfg.property_address, badges, photo_code=cfg.property_code)
@@ -123,19 +176,25 @@ def render_property_detail(
     st.divider()
 
     if section == "Summary":
-        _render_summary(cfg, result, rent_roll)
+        _render_summary(cfg, result, rent_roll, cash_accounts, loan_statements)
     elif section == "Cash":
         _render_cash(result, cash_accounts)
     elif section == "Equity & Capital":
         _render_equity(result)
     elif section == "Balance Sheet":
         _render_balance_sheet(result)
+    elif section == "Rent Roll":
+        _render_rent_roll(rent_roll)
     elif section == "Debt & Loans":
         _render_debt(cfg, result, loan_statements)
+    elif section == "Reconciliation":
+        _render_reconciliation(cfg, entity_trial_balances, loan_statements, result)
     elif section == "Distribution Waterfall":
         _render_waterfall(cfg, result)
     elif section == "Budget vs. Actuals":
         _render_budget(result)
+    elif section == "Annual Budget":
+        _render_annual_budget(result)
     elif section == "Sources & Uses":
         st.info(
             "Sources & Uses will populate once the leasing/investment outlook model is finalized — "
@@ -149,9 +208,17 @@ def render_property_detail(
 
 
 def _render_summary(
-    cfg: PropertyConfig, result: Optional[DistributionWorkbookResult], rent_roll: Optional[RentRollResult]
+    cfg: PropertyConfig,
+    result: Optional[DistributionWorkbookResult],
+    rent_roll: Optional[RentRollResult],
+    cash_accounts: Optional[List[CashAccountBalance]] = None,
+    loan_statements: Optional[List[LoanStatement]] = None,
 ) -> None:
-    cash_on_hand = _total_cash(result)
+    cash_accounts = cash_accounts or []
+    loan_statements = loan_statements or []
+
+    total_cash = _total_cash_all_sources(result, cash_accounts)
+    debt_total, debt_sub = _current_debt(result, loan_statements)
     noi_today = None
     noi_period = None
     if result and result.budget_summary:
@@ -163,8 +230,9 @@ def _render_summary(
     noi_sub = f"as of {noi_period.strftime('%B %Y')}" if noi_period else None
     render_kpi_tiles(
         [
-            ("Cash on Hand", _fmt_money(cash_on_hand), None),
+            ("Current Cash", _fmt_money(total_cash), "all accounts, all entities"),
             ("NOI (Last Actual Month)", _fmt_money(noi_today), noi_sub),
+            ("Total Debt Outstanding", _fmt_money(debt_total), debt_sub),
             ("Stabilized NOI", "—", "pending leasing model"),
         ]
     )
@@ -175,13 +243,51 @@ def _render_summary(
     with col2:
         if st.button("View Detailed Breakdown →", key="goto_noi_detail"):
             _goto("Budget vs. Actuals", budget_subtab="Detailed")
+    with col3:
+        if st.button("View Debt & Loans →", key="goto_debt_top"):
+            _goto("Debt & Loans")
     if noi_period:
         st.caption(f"NOI as of {noi_period.strftime('%B %Y')} — the last month the Cash Flow tab labels as Actuals.")
     st.caption("Stabilized NOI will populate once the leasing/investment outlook model is finalized.")
 
     st.divider()
+    st.markdown("#### Current Cash — by Account")
+    cash_rows = [
+        {"Account": label, "Balance": value}
+        for label, value, _source in _cash_boxes(result, cash_accounts)
+    ]
+    if cash_rows:
+        st.dataframe(
+            pd.DataFrame(cash_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={"Balance": _money_col()},
+        )
+        st.caption(
+            "Includes JV/venture-level operating cash (from the distribution workbook's equity tabs) "
+            "and property-level development cash + escrows/reserves (from the trial balance or loan "
+            "statements) — these are different, non-overlapping entities' cash, not duplicates."
+        )
+    else:
+        st.info("No cash account data available yet.")
+
+    st.divider()
     st.markdown("#### Loan Terms")
-    if result and result.debt and result.debt.tranches:
+    if loan_statements:
+        df = pd.DataFrame(
+            [
+                {"Tranche": s.tranche_name, "Balance": s.principal_balance, "Rate": _pct100(s.interest_rate)}
+                for s in loan_statements
+            ]
+        )
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            column_config={"Balance": _money_col(), "Rate": _pct_col()},
+        )
+        st.caption(f"Actual balances and all-in rates, per lender statements ({debt_sub}).")
+    elif result and result.debt and result.debt.tranches:
         df = pd.DataFrame(
             [
                 {"Tranche": t.tranche_name, "Balance": t.outstanding_balance, "Rate": _pct100(t.interest_rate)}
@@ -194,9 +300,11 @@ def _render_summary(
             hide_index=True,
             column_config={"Balance": _money_col(), "Rate": _pct_col()},
         )
-        st.caption("Full loan terms (maturity, extension options, covenants) pending loan abstracts.")
-        if st.button("View Debt & Loans →", key="goto_debt"):
-            _goto("Debt & Loans")
+        st.caption(
+            "Forecast from the distribution workbook — rate shown is the spread over SOFR, not the "
+            "all-in rate, and the balance assumes a paydown that may not have posted yet. No loan "
+            "statements uploaded yet for actuals."
+        )
     else:
         st.info("No loan data available.")
 
@@ -218,46 +326,13 @@ def _render_summary(
                 ("Vacant SF", f"{rent_roll.total_vacant_sf:,.0f}", None),
             ]
         )
-
-        df = pd.DataFrame(
-            [
-                {
-                    "Unit": line.unit_code,
-                    "Floor": line.floor,
-                    "Tenant": line.tenant_name if not line.is_vacant else "VACANT",
-                    "SF": line.unit_area,
-                    "Lease Start": line.lease_from,
-                    "Lease End": line.lease_to,
-                    "Annual Rent": line.annual_rent,
-                    "Rent/SF": line.annual_rent_psf,
-                    "Lease Type": line.lease_type,
-                }
-                for line in rent_roll.lines
-            ]
-        )
-        st.dataframe(
-            df,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "SF": st.column_config.NumberColumn(format="%,d"),
-                "Annual Rent": _money_col(),
-                "Rent/SF": st.column_config.NumberColumn(format="$%,.2f"),
-            },
-        )
+        if st.button("View Rent Roll →", key="goto_rent_roll"):
+            _goto("Rent Roll")
 
 
 def _render_cash(result: Optional[DistributionWorkbookResult], cash_accounts: List[CashAccountBalance]) -> None:
-    boxes = [("Operating Cash (all entities)", _total_cash(result), "equity_tabs")]
-    boxes.append(("DACA", None, "placeholder"))
-
-    if cash_accounts:
-        seen = set()
-        for acct in cash_accounts:
-            if acct.label in seen:
-                continue
-            seen.add(acct.label)
-            boxes.append((acct.label, acct.balance, acct.source))
+    boxes = _cash_boxes(result, cash_accounts)
+    boxes.insert(1, ("DACA", None, "placeholder"))  # display-only — no source yet, excluded from any total
 
     render_kpi_tiles([(label, _fmt_money(value), None) for label, value, _source in boxes])
 
@@ -365,6 +440,111 @@ def _render_balance_sheet(result: Optional[DistributionWorkbookResult]) -> None:
         st.divider()
 
 
+def _render_rent_roll(rent_roll: Optional[RentRollResult]) -> None:
+    if not rent_roll or not rent_roll.lines:
+        st.info("Not yet provided — upload a Tenancy Schedule export in the sidebar (Property Detail view).")
+        return
+
+    as_of = rent_roll.as_of
+    if as_of:
+        st.caption(f"As of {as_of.strftime('%B %d, %Y')}")
+
+    walt = rent_roll.weighted_average_lease_term_years(as_of) if as_of else None
+    avg_rent = rent_roll.avg_annual_rent_psf
+    avg_cam = rent_roll.avg_annual_cam_psf
+    render_kpi_tiles(
+        [
+            ("% Leased", _fmt_pct(rent_roll.occupancy_pct), None),
+            ("WALT", f"{walt:.1f} yrs" if walt is not None else "—", "SF-weighted"),
+            ("Avg Rent", f"${avg_rent:,.2f}/SF" if avg_rent is not None else "—", None),
+            ("Avg CAM", f"${avg_cam:,.2f}/SF" if avg_cam is not None else "—", None),
+        ]
+    )
+    render_kpi_tiles(
+        [
+            ("Leased SF", f"{rent_roll.total_leased_sf:,.0f}", None),
+            ("Vacant SF", f"{rent_roll.total_vacant_sf:,.0f}", None),
+            ("Total Annual Rent", _fmt_money(rent_roll.total_annual_rent), None),
+            ("Total Annual CAM", _fmt_money(rent_roll.total_annual_cam), None),
+        ]
+    )
+
+    st.divider()
+    rows = []
+    for line in rent_roll.lines:
+        next_step = line.next_rent_step(as_of) if as_of else None
+        rows.append(
+            {
+                "Tenant": line.tenant_name if not line.is_vacant else "VACANT",
+                "Unit": line.unit_code,
+                "SF": line.lease_area or line.unit_area,
+                "Lease Expiration": line.lease_to,
+                "Current Rent": line.annual_rent,
+                "Current CAM": line.current_annual_cam,
+                "Total Obligation": line.current_total_obligation,
+                "LOC/SD": line.loc_amount,
+                "Next Step Date": next_step.effective_date if next_step else None,
+                "Next Step Rent": next_step.annual_rent if next_step else None,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "SF": st.column_config.NumberColumn(format="%,d"),
+            "Current Rent": _money_col(),
+            "Current CAM": _money_col(),
+            "Total Obligation": _money_col(),
+            "LOC/SD": _money_col(),
+            "Next Step Rent": _money_col(),
+        },
+    )
+    st.caption(
+        '"Current CAM" sums every non-Rent charge line on the lease — the export labels them all '
+        '"CAM" without distinguishing RE-Tax vs. Operating components (see the breakdown below per '
+        "tenant). \"LOC/SD\" is the letter-of-credit / bank-guarantee amount on file for that lease."
+    )
+
+    st.divider()
+    st.markdown("#### Escalation Schedules & Charge Detail")
+    for line in rent_roll.lines:
+        if line.is_vacant:
+            continue
+        with st.expander(f"{line.tenant_name} — Unit {line.unit_code}"):
+            if line.charges:
+                st.markdown("**Current charges**")
+                for charge in line.charges:
+                    note = (
+                        " (component not specified in source file)"
+                        if charge.charge_type.strip().upper() != "RENT"
+                        else ""
+                    )
+                    st.write(f"{charge.charge_type}: {_fmt_money(charge.annual_amount)}{note}")
+            if line.rent_steps:
+                st.markdown("**Rent escalation schedule**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Effective Date": s.effective_date,
+                                "Annual Rent": s.annual_rent,
+                                "Rent/SF": s.annual_rent_psf,
+                            }
+                            for s in line.rent_steps
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Annual Rent": _money_col(),
+                        "Rent/SF": st.column_config.NumberColumn(format="$%,.2f"),
+                    },
+                )
+            if line.loc_amount:
+                st.caption(f"LOC / Security Deposit: {_fmt_money(line.loc_amount)}")
+
+
 def _normalize_tranche(name: str) -> str:
     return re.sub(r"\d+$", "", name.lower().replace(" ", ""))
 
@@ -454,6 +634,161 @@ def _render_debt(
                     st.json(abstract)
                 else:
                     st.caption("No abstract on file yet — run `tools/extract_loan_abstract.py`.")
+
+
+def _match_ownership_tier(cfg: PropertyConfig, entity_name: str):
+    entity_lower = (entity_name or "").lower()
+    if not entity_lower:
+        return None
+    for tier_cfg in cfg.ownership_tiers:
+        tier_entity_lower = tier_cfg.distributing_entity.lower()
+        if tier_entity_lower and (tier_entity_lower in entity_lower or entity_lower in tier_entity_lower):
+            return tier_cfg
+    return None
+
+
+def _render_reconciliation(
+    cfg: PropertyConfig,
+    entity_trial_balances: List[EntityTrialBalance],
+    loan_statements: List[LoanStatement],
+    result: Optional[DistributionWorkbookResult],
+) -> None:
+    st.caption(
+        "Cross-checks each uploaded trial balance's own figures against the other source files that "
+        "should describe the same real-world balance — nothing here is ever combined across entities, "
+        "since different levels of the JV structure hold genuinely different pools of cash/equity."
+    )
+
+    if not entity_trial_balances:
+        st.info(
+            'No trial balances uploaded yet — drop one in via "Update Source Files" in the sidebar to '
+            "see per-entity payables, receivables, and equity, plus cross-checks against the loan "
+            "statements and distribution waterfall."
+        )
+        return
+
+    loan_total = sum(s.principal_balance or 0 for s in loan_statements) if loan_statements else None
+
+    for entity in entity_trial_balances:
+        st.markdown(f"### {entity.entity_name or entity.entity_code}")
+        if entity.as_of:
+            st.caption(f"As of {entity.as_of.strftime('%B %Y')}")
+
+        render_kpi_tiles(
+            [
+                ("Accounts Receivable (Rent Outstanding)", _fmt_money(entity.accounts_receivable), None),
+                ("Accounts Payable (Outstanding)", _fmt_money(entity.accounts_payable), None),
+                ("Contributions", _fmt_money(entity.contributions), None),
+                ("Distributions", _fmt_money(entity.distributions), None),
+            ]
+        )
+        render_kpi_tiles(
+            [
+                ("Retained Earnings", _fmt_money(entity.retained_earnings), None),
+                ("Mortgage Payable (per Trial Balance)", _fmt_money(entity.mortgage_payable), None),
+            ]
+        )
+
+        st.markdown("**Mortgage Payable cross-check (vs. Loan Statements)**")
+        if entity.mortgage_payable is not None and loan_total is not None:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"Source": "Trial Balance", "Balance": entity.mortgage_payable},
+                        {"Source": "Loan Statements (Actual)", "Balance": loan_total},
+                        {"Source": "Variance", "Balance": entity.mortgage_payable - loan_total},
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={"Balance": _money_col()},
+            )
+        elif entity.mortgage_payable is not None:
+            st.caption("Mortgage Payable is on file, but no loan statements are loaded yet to cross-check against.")
+        else:
+            st.caption("No Mortgage Payable account found in this trial balance.")
+
+        st.markdown("**Cash / Escrow cross-check (vs. Loan Statements)**")
+        escrow_rows = []
+        for acct in entity.cash_accounts:
+            label_lower = acct.label.lower()
+            for stmt in loan_statements:
+                stmt_value = None
+                if "tax escrow" in label_lower:
+                    stmt_value = stmt.tax_escrow_balance
+                elif "insurance escrow" in label_lower:
+                    stmt_value = stmt.insurance_escrow_balance
+                elif "reserve" in label_lower:
+                    stmt_value = stmt.reserve_balance
+                if stmt_value is not None:
+                    escrow_rows.append(
+                        {
+                            "Account": acct.label,
+                            "Trial Balance": acct.balance,
+                            "Loan Statement": stmt_value,
+                            "Variance": (acct.balance or 0.0) - stmt_value,
+                        }
+                    )
+                    break
+        if not loan_statements:
+            st.caption("No loan statements loaded yet to cross-check cash/escrow balances against.")
+        elif escrow_rows:
+            st.dataframe(
+                pd.DataFrame(escrow_rows),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Trial Balance": _money_col(),
+                    "Loan Statement": _money_col(),
+                    "Variance": _money_col(),
+                },
+            )
+        else:
+            st.caption("No escrow/reserve accounts in this trial balance matched a loan statement's escrow fields.")
+
+        st.markdown("**Contributions / Distributions cross-check (vs. Distribution Waterfall)**")
+        matched_tier = _match_ownership_tier(cfg, entity.entity_name)
+        if not matched_tier:
+            st.caption(
+                f'No ownership tier is configured for "{entity.entity_name}" — nothing to cross-check at '
+                "this level yet. This is expected for the property-level entity, which sits below the "
+                "venture tier in the JV structure; it'll apply once a venture- or co-GP-level trial "
+                "balance is uploaded."
+            )
+        elif not result or not result.waterfall or matched_tier.tier_id not in result.waterfall.tiers:
+            st.caption(f'Matched to the "{matched_tier.label()}" tier, but no waterfall data is loaded to compare against.')
+        else:
+            wf_tier = result.waterfall.tiers[matched_tier.tier_id]
+            wf_contrib = sum(inv.contributions_to_date or 0.0 for inv in wf_tier.investors)
+            wf_dist = sum(abs(inv.distributions_to_date or 0.0) for inv in wf_tier.investors)
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Metric": "Contributions",
+                            "Trial Balance": entity.contributions,
+                            "Waterfall (to date)": wf_contrib,
+                            "Variance": (entity.contributions or 0.0) - wf_contrib,
+                        },
+                        {
+                            "Metric": "Distributions",
+                            "Trial Balance": entity.distributions,
+                            "Waterfall (to date)": wf_dist,
+                            "Variance": (entity.distributions or 0.0) - wf_dist,
+                        },
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Trial Balance": _money_col(),
+                    "Waterfall (to date)": _money_col(),
+                    "Variance": _money_col(),
+                },
+            )
+            st.caption(f'Matched to the "{matched_tier.label()}" tier ({matched_tier.distributing_entity}).')
+
+        st.divider()
 
 
 def _render_waterfall_tier(tier: WaterfallTier, indent: int = 0) -> None:
@@ -622,3 +957,29 @@ def _render_budget(result: Optional[DistributionWorkbookResult]) -> None:
                 hide_index=True,
                 column_config=_budget_column_config(),
             )
+
+
+def _render_annual_budget(result: Optional[DistributionWorkbookResult]) -> None:
+    if not result or not result.annual_budget_summary or not result.annual_budget_summary.lines:
+        st.info("No annual budget comparison available.")
+        return
+
+    ytd_through = result.annual_budget_summary.period
+    if ytd_through:
+        st.caption(
+            f"Annual Budget = full-year {ytd_through.year} budget. YTD Actual = January "
+            f"through {ytd_through.strftime('%B %Y')} (the last month the Cash Flow tab labels "
+            "as Actuals)."
+        )
+    st.dataframe(
+        _budget_lines_df(result.annual_budget_summary.lines, lambda line: line.account_label),
+        width="stretch",
+        hide_index=True,
+        column_config=_budget_column_config(),
+    )
+    st.caption(
+        "Capital Expenditures and Cash Flow after Debt Service aren't in the monthly Budget vs. "
+        "Actuals view — added here to match the full-year waterfall Ryan's own Kardin budget "
+        "report uses (Income → OpEx → NOI → Debt Service → CapEx). Net Income is left out: it's a "
+        "trailing-12-month actual-only figure, a different concept from a January-through-YTD sum."
+    )

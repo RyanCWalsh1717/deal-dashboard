@@ -13,7 +13,12 @@ import openpyxl
 
 from pipeline.models import DistributionWaterfall, DistributionWorkbookResult
 from pipeline.parsers._shared import parse_as_of_date
-from pipeline.parsers.budget_vs_actual import build_pnl_summary, parse_budget_comparison, parse_budget_tab
+from pipeline.parsers.budget_vs_actual import (
+    build_annual_pnl_summary,
+    build_pnl_summary,
+    parse_budget_comparison,
+    parse_budget_tab,
+)
 from pipeline.parsers.cash_flow import parse_cash_flow
 from pipeline.parsers.debt import parse_debt_tranches
 from pipeline.parsers.equity import parse_equity_tab
@@ -61,6 +66,7 @@ def parse_workbook(path: Union[str, Path], cfg: PropertyConfig) -> DistributionW
 
     budget_comparison = None
     budget_summary = None
+    annual_budget_summary = None
     budget_sheet = sheet_map.get("budget_current")
     if budget_sheet and budget_sheet in wb.sheetnames and cash_flow is not None:
         budget_result = parse_budget_tab(wb[budget_sheet], cfg.property_code)
@@ -74,6 +80,7 @@ def parse_workbook(path: Union[str, Path], cfg: PropertyConfig) -> DistributionW
         if period:
             budget_comparison = parse_budget_comparison(budget_result, cash_flow, period, cfg.property_code)
             budget_summary = build_pnl_summary(cash_flow, budget_result, period, cfg.property_code)
+            annual_budget_summary = build_annual_pnl_summary(cash_flow, budget_result, period, cfg.property_code)
 
     return DistributionWorkbookResult(
         property_code=cfg.property_code,
@@ -86,4 +93,5 @@ def parse_workbook(path: Union[str, Path], cfg: PropertyConfig) -> DistributionW
         projected_waterfall=None,  # no parser exists until the investment model is finalized
         budget_comparison=budget_comparison,
         budget_summary=budget_summary,
+        annual_budget_summary=annual_budget_summary,
     )

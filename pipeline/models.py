@@ -216,6 +216,7 @@ class DistributionWorkbookResult:
     projected_waterfall: Optional[ProjectedDistributionWaterfall] = None
     budget_comparison: Optional[BudgetComparisonResult] = None
     budget_summary: Optional[BudgetComparisonResult] = None
+    annual_budget_summary: Optional[BudgetComparisonResult] = None
 
 
 @dataclass
@@ -229,6 +230,55 @@ class CashAccountBalance:
     account_code: str = ""
     source: str = ""
     as_of: Optional[date] = None
+    entity_code: str = ""  # which entity's TB this came from — see EntityTrialBalance; "" for non-TB sources
+
+
+@dataclass
+class EntityTrialBalance:
+    """One entity's full trial balance — cash/escrow accounts (for the Cash
+    tab) plus the handful of balance-sheet figures the Reconciliation
+    section cross-checks against other source files (loan statements, the
+    distribution workbook's waterfall). All liability/equity figures below
+    are stored as positive magnitudes even though the export's own sign
+    convention shows most of them as negative (credit-normal) — they're
+    always compared against externally-sourced positive figures, so keeping
+    a consistent positive sign here avoids a misleading "looks like the
+    opposite number" cross-check display. Retained Earnings is the
+    exception: its sign (surplus vs. accumulated deficit) is itself
+    meaningful, so it keeps the export's own sign."""
+
+    entity_code: str
+    entity_name: str = ""
+    as_of: Optional[date] = None
+    cash_accounts: List[CashAccountBalance] = field(default_factory=list)
+    accounts_receivable: Optional[float] = None
+    accounts_payable: Optional[float] = None
+    contributions: Optional[float] = None
+    distributions: Optional[float] = None
+    retained_earnings: Optional[float] = None
+    mortgage_payable: Optional[float] = None
+
+
+@dataclass
+class ChargeLine:
+    """One current-period charge on a lease (e.g. base Rent, or a CAM
+    reimbursement) — the Tenancy Schedule export only ever labels these
+    "Rent" or "CAM"; it never splits CAM into its RE-Tax/Operating
+    components, so multiple CAM lines on one lease can't be told apart
+    beyond "not Rent" (see RentRollLine.current_annual_cam)."""
+
+    charge_type: str
+    annual_amount: float
+
+
+@dataclass
+class RentStep:
+    """One dated point in a lease's contracted future rent-escalation
+    schedule (already agreed in the lease, not a projection)."""
+
+    effective_date: date
+    annual_rent: float
+    annual_rent_psf: Optional[float] = None
 
 
 @dataclass
@@ -246,6 +296,24 @@ class RentRollLine:
     annual_rent_psf: Optional[float] = None
     lease_type: str = ""
     is_vacant: bool = False
+    loc_amount: Optional[float] = None
+    charges: List[ChargeLine] = field(default_factory=list)
+    rent_steps: List[RentStep] = field(default_factory=list)
+
+    @property
+    def current_annual_cam(self) -> Optional[float]:
+        cam = [c.annual_amount for c in self.charges if c.charge_type.strip().upper() != "RENT"]
+        return sum(cam) if cam else None
+
+    @property
+    def current_total_obligation(self) -> Optional[float]:
+        if self.annual_rent is None:
+            return None
+        return self.annual_rent + (self.current_annual_cam or 0.0)
+
+    def next_rent_step(self, as_of: date) -> Optional[RentStep]:
+        upcoming = [s for s in self.rent_steps if s.effective_date > as_of]
+        return min(upcoming, key=lambda s: s.effective_date) if upcoming else None
 
 
 @dataclass
@@ -256,7 +324,12 @@ class RentRollResult:
 
     @property
     def total_leased_sf(self) -> float:
-        return sum(l.unit_area or 0.0 for l in self.lines if not l.is_vacant)
+        # Prefer lease_area over unit_area — some leases span more than one
+        # physical unit (e.g. an office suite plus a penthouse), and
+        # lease_area is the combined total while unit_area only covers the
+        # first unit. Vacant lines have no lease_area, so they fall back to
+        # unit_area (their only figure).
+        return sum((l.lease_area or l.unit_area or 0.0) for l in self.lines if not l.is_vacant)
 
     @property
     def total_vacant_sf(self) -> float:
@@ -267,9 +340,36 @@ class RentRollResult:
         return sum(l.annual_rent or 0.0 for l in self.lines if not l.is_vacant)
 
     @property
+    def total_annual_cam(self) -> float:
+        return sum(l.current_annual_cam or 0.0 for l in self.lines if not l.is_vacant)
+
+    @property
     def occupancy_pct(self) -> Optional[float]:
         total = self.total_leased_sf + self.total_vacant_sf
         return (self.total_leased_sf / total) if total else None
+
+    @property
+    def avg_annual_rent_psf(self) -> Optional[float]:
+        sf = self.total_leased_sf
+        return (self.total_annual_rent / sf) if sf else None
+
+    @property
+    def avg_annual_cam_psf(self) -> Optional[float]:
+        sf = self.total_leased_sf
+        return (self.total_annual_cam / sf) if sf else None
+
+    def weighted_average_lease_term_years(self, as_of: date) -> Optional[float]:
+        """SF-weighted WALT over leases with a known expiration — vacant
+        space and leases with no lease_to are excluded (nothing to weight)."""
+        weighted = [
+            (l.lease_area or l.unit_area or 0.0, (l.lease_to - as_of).days / 365.25)
+            for l in self.lines
+            if not l.is_vacant and l.lease_to
+        ]
+        total_sf = sum(w for w, _ in weighted)
+        if not total_sf:
+            return None
+        return sum(w * t for w, t in weighted) / total_sf
 
 
 @dataclass

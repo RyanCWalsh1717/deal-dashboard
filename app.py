@@ -16,7 +16,7 @@ if str(APP_DIR) not in sys.path:
 
 from pipeline import source_files
 from pipeline.models import PortfolioSummaryRow
-from pipeline.parsers.cash_accounts import parse_loan_statement, parse_trial_balance_cash_accounts
+from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.distribution_workbook import parse_workbook
 from pipeline.parsers.rent_roll import parse_rent_roll
 from pipeline.property_config import PropertyConfig, discover_properties
@@ -63,15 +63,18 @@ def _resolve_workbook_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[
 
 
 @st.cache_data(show_spinner="Parsing trial balance...")
-def _cached_trial_balance(path_str: str, mtime: float, yardi_codes: tuple):
-    return parse_trial_balance_cash_accounts(path_str, list(yardi_codes))
+def _cached_entity_trial_balance(path_str: str, mtime: float, yardi_codes: tuple):
+    return parse_entity_trial_balance(path_str, list(yardi_codes))
 
 
-def _resolve_trial_balance_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[Optional[Path], Optional[float]]:
+def _discover_trial_balance_paths(cfg: PropertyConfig, period: Optional[str]) -> dict:
+    """Returns {path_str: mtime} for every trial-balance file resolved for
+    this property + period — one per entity (property, venture, co-GP, ...),
+    with carry-forward to the nearest earlier period that has any, via
+    `source_files.resolve_period_trial_balances`."""
     if not period:
-        return None, None
-    p = source_files.resolve_period_file(cfg, period, "trial_balance.xlsx", str(DATA_DIR))
-    return (p, p.stat().st_mtime) if p else (None, None)
+        return {}
+    return {str(p): p.stat().st_mtime for p in source_files.resolve_period_trial_balances(cfg, period, str(DATA_DIR))}
 
 
 @st.cache_data(show_spinner="Parsing loan statement...")
@@ -242,13 +245,14 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Failed to parse workbook: {exc}")
 
-    tb_path, tb_mtime = _resolve_trial_balance_path(cfg, selected_period)
-    cash_accounts = []
-    if tb_path is not None:
+    entity_trial_balances = []
+    for path_str, tb_mtime in _discover_trial_balance_paths(cfg, selected_period).items():
         try:
-            cash_accounts = _cached_trial_balance(str(tb_path), tb_mtime, tuple(cfg.yardi_codes))
+            entity_trial_balances.extend(_cached_entity_trial_balance(path_str, tb_mtime, tuple(cfg.yardi_codes)))
         except Exception as exc:
-            st.error(f"Failed to parse trial balance: {exc}")
+            st.error(f"Failed to parse trial balance ({Path(path_str).name}): {exc}")
+
+    cash_accounts = [acct for entity in entity_trial_balances for acct in entity.cash_accounts]
 
     loan_statements = []
     for path_str, ls_mtime in _discover_loan_statement_paths(cfg, selected_period).items():
@@ -273,7 +277,7 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Failed to parse rent roll: {exc}")
 
-    render_property_detail(cfg, result, cash_accounts, rent_roll, loan_statements)
+    render_property_detail(cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances)
 
 
 if not check_password():

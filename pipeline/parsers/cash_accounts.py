@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Union
 
-from pipeline.models import CashAccountBalance, LoanStatement
+from pipeline.models import CashAccountBalance, EntityTrialBalance, LoanStatement
 
 _HEADER_RE = re.compile(
     r"Property:\s*(?P<label>.+?)\s+Loan No:\s*(?P<loan_no>\S+)\s+Interest Rate:\s*(?P<rate>[\d.]+)"
@@ -84,62 +84,112 @@ def loan_statement_cash_accounts(stmt: LoanStatement) -> List[CashAccountBalance
 _ENTITY_HEADER_RE = re.compile(r"Property\s*=\s*(\S+)")
 _CASH_LABEL_KEYWORDS = ("cash - operating", "cash - development", "restricted cash", "escrow", "reserve")
 
+# Balance-sheet accounts the Reconciliation section cross-checks against
+# other source files. Matched by label keyword (like _CASH_LABEL_KEYWORDS
+# above) rather than a hardcoded account code, so this doesn't break if a
+# different property's chart of accounts numbers things differently.
+_AP_LABEL_KEYWORDS = ("accounts payable",)
+_AR_LABEL_KEYWORDS = ("accounts receivable - control", "accounts receivable - tenant billback")
+_CONTRIBUTIONS_LABEL_KEYWORDS = ("contributions",)
+_DISTRIBUTIONS_LABEL_KEYWORDS = ("distributions",)
+_RETAINED_EARNINGS_LABEL_KEYWORDS = ("retained earnings",)
+_MORTGAGE_LABEL_KEYWORDS = ("mortgage payable",)
 
-def parse_trial_balance_cash_accounts(
-    path: Union[str, Path], yardi_codes: Optional[List[str]] = None
-) -> List[CashAccountBalance]:
-    """Scans a Yardi trial balance export for cash/escrow/reserve accounts,
-    restricted to entity block(s) matching one of `yardi_codes` (a TB export
-    can cover more than one property, and the dashboard's own property_code
-    is just an internal folder name that won't match Yardi's real codes — see
-    PropertyConfig.yardi_codes). If `yardi_codes` is empty/None, or no
-    matching block is found, falls back to scanning the whole sheet (better
-    than silently returning nothing, but callers should prefer passing it)."""
-    import openpyxl
 
-    yardi_codes = yardi_codes or []
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.worksheets[0]
-
-    as_of = None
+def _parse_tb_as_of(ws) -> Optional[object]:
     for row in ws.iter_rows(min_row=1, max_row=6, max_col=1):
         v = row[0].value
         if isinstance(v, str) and v.strip().lower().startswith("period"):
             period_text = v.split("=", 1)[1].strip() if "=" in v else v.strip()
             try:
-                as_of = datetime.strptime(period_text, "%B %Y").date()
+                return datetime.strptime(period_text, "%B %Y").date()
             except ValueError:
                 pass
+    return None
+
+
+def _accumulate(current: Optional[float], label_lower: str, keywords: tuple, amount: float, positive: bool) -> Optional[float]:
+    if not any(kw in label_lower for kw in keywords):
+        return current
+    signed = abs(amount) if positive else amount
+    return (current or 0.0) + signed
+
+
+def parse_entity_trial_balance(
+    path: Union[str, Path], yardi_codes: Optional[List[str]] = None
+) -> List[EntityTrialBalance]:
+    """Parses every entity block in a Yardi trial balance export into a full
+    EntityTrialBalance — cash/escrow accounts (same rows
+    parse_trial_balance_cash_accounts() has always returned) plus the
+    Accounts Receivable / Accounts Payable / Contributions / Distributions /
+    Retained Earnings / Mortgage Payable figures the Reconciliation section
+    needs. Restricted to entity block(s) matching `yardi_codes`, same
+    convention as parse_trial_balance_cash_accounts() (see that docstring
+    for why yardi_codes rather than the dashboard's own property_code)."""
+    import openpyxl
+
+    yardi_codes = yardi_codes or []
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.worksheets[0]
+    as_of = _parse_tb_as_of(ws)
 
     # Column layout: 1=code, 2=label, 3=forward, 4=debit, 5=credit, 6=ending balance.
-    results: List[CashAccountBalance] = []
+    entities: List[EntityTrialBalance] = []
+    current: Optional[EntityTrialBalance] = None
     in_target_block = not yardi_codes
+
     for r in range(1, ws.max_row + 1):
         col1 = ws.cell(row=r, column=1).value
         if isinstance(col1, str) and col1.strip().lower().startswith("property"):
             entity_match = _ENTITY_HEADER_RE.search(col1)
-            block_code = entity_match.group(1) if entity_match else col1
+            block_code = entity_match.group(1) if entity_match else col1.strip()
+            entity_name = col1.split("=", 1)[1].strip() if "=" in col1 else col1.strip()
             in_target_block = not yardi_codes or any(code in block_code for code in yardi_codes)
+            current = EntityTrialBalance(entity_code=block_code, entity_name=entity_name, as_of=as_of) if in_target_block else None
+            if current:
+                entities.append(current)
             continue
 
-        if not in_target_block:
+        if not in_target_block or current is None:
             continue
 
         label = ws.cell(row=r, column=2).value
         ending = ws.cell(row=r, column=6).value
         if not isinstance(label, str) or not isinstance(ending, (int, float)):
             continue
-        if not any(kw in label.lower() for kw in _CASH_LABEL_KEYWORDS):
-            continue
+        label_lower = label.strip().lower()
+        amount = float(ending)
 
-        results.append(
-            CashAccountBalance(
-                label=label.strip(),
-                balance=float(ending),
-                account_code=str(col1) if col1 is not None else "",
-                source="trial_balance",
-                as_of=as_of,
+        if any(kw in label_lower for kw in _CASH_LABEL_KEYWORDS):
+            current.cash_accounts.append(
+                CashAccountBalance(
+                    label=label.strip(),
+                    balance=amount,
+                    account_code=str(col1) if col1 is not None else "",
+                    source="trial_balance",
+                    as_of=as_of,
+                    entity_code=current.entity_code,
+                )
             )
-        )
 
-    return results
+        current.accounts_receivable = _accumulate(current.accounts_receivable, label_lower, _AR_LABEL_KEYWORDS, amount, positive=True)
+        current.accounts_payable = _accumulate(current.accounts_payable, label_lower, _AP_LABEL_KEYWORDS, amount, positive=True)
+        current.contributions = _accumulate(current.contributions, label_lower, _CONTRIBUTIONS_LABEL_KEYWORDS, amount, positive=True)
+        current.distributions = _accumulate(current.distributions, label_lower, _DISTRIBUTIONS_LABEL_KEYWORDS, amount, positive=False)
+        current.retained_earnings = _accumulate(current.retained_earnings, label_lower, _RETAINED_EARNINGS_LABEL_KEYWORDS, amount, positive=False)
+        current.mortgage_payable = _accumulate(current.mortgage_payable, label_lower, _MORTGAGE_LABEL_KEYWORDS, amount, positive=True)
+
+    return entities
+
+
+def parse_trial_balance_cash_accounts(
+    path: Union[str, Path], yardi_codes: Optional[List[str]] = None
+) -> List[CashAccountBalance]:
+    """Thin wrapper over parse_entity_trial_balance() for callers that only
+    need the Cash-tab account boxes, not the full entity balance-sheet
+    figures. If `yardi_codes` is empty/None, or no matching block is found,
+    parse_entity_trial_balance() falls back to scanning the whole sheet
+    (better than silently returning nothing, but callers should prefer
+    passing yardi_codes)."""
+    entities = parse_entity_trial_balance(path, yardi_codes)
+    return [acct for entity in entities for acct in entity.cash_accounts]
