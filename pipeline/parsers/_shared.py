@@ -83,6 +83,36 @@ def find_label_near(ws: Worksheet, row: int, base_col: int, max_extra: int = 2) 
     return None
 
 
+def find_header_col(
+    ws: Worksheet,
+    *label_parts: str,
+    after: int = 0,
+    header_rows: Tuple[int, ...] = (3, 4),
+    max_col: int = 60,
+) -> Optional[int]:
+    """Finds a column by its header TEXT rather than a hardcoded position —
+    column position isn't stable between export runs of the same report
+    (confirmed on the Tenancy Schedule: inserting one new column shifted
+    everything after it), but the header text for a given concept is. Joins
+    each column's multi-row header (some Tenancy Schedule headers split
+    across two rows, e.g. "LOC Amount/" + "Bank Guarantee") and returns the
+    first column, scanning left-to-right from `after`+1, whose lowercased
+    joined text contains every one of `label_parts` as a substring.
+
+    When the same header text appears more than once in a sheet (e.g. two
+    "Annual Rent/Area"-shaped columns — the primary row's own PSF rent, and
+    a second one inside a later repeating block), the leftmost match wins
+    unless the caller passes `after` to start scanning past an earlier
+    anchor column."""
+    for c in range(after + 1, max_col + 1):
+        parts = [ws.cell(row=r, column=c).value for r in header_rows]
+        text = " ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+        text = text.lower()
+        if text and all(part.lower() in text for part in label_parts):
+            return c
+    return None
+
+
 def extract_year(text: str) -> Optional[int]:
     match = re.search(r"(20\d{2})", text or "")
     return int(match.group(1)) if match else None

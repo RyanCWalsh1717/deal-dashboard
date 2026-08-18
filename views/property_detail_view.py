@@ -501,9 +501,9 @@ def _render_rent_roll(rent_roll: Optional[RentRollResult]) -> None:
         },
     )
     st.caption(
-        '"Current CAM" sums every non-Rent charge line on the lease — the export labels them all '
-        '"CAM" without distinguishing RE-Tax vs. Operating components (see the breakdown below per '
-        "tenant). \"LOC/SD\" is the letter-of-credit / bank-guarantee amount on file for that lease."
+        '"Current CAM" sums every non-Rent charge line on the lease — see the breakdown below per '
+        'tenant for the component detail (RE Tax vs. Operating recovery, where the export provides '
+        "it). \"LOC/SD\" is the letter-of-credit / bank-guarantee amount on file for that lease."
     )
 
     st.divider()
@@ -515,12 +515,13 @@ def _render_rent_roll(rent_roll: Optional[RentRollResult]) -> None:
             if line.charges:
                 st.markdown("**Current charges**")
                 for charge in line.charges:
-                    note = (
-                        " (component not specified in source file)"
-                        if charge.charge_type.strip().upper() != "RENT"
-                        else ""
-                    )
-                    st.write(f"{charge.charge_type}: {_fmt_money(charge.annual_amount)}{note}")
+                    if charge.description:
+                        label = charge.description
+                    elif charge.charge_type.strip().upper() == "RENT":
+                        label = charge.charge_type
+                    else:
+                        label = f"{charge.charge_type} (component not specified in source file)"
+                    st.write(f"{label}: {_fmt_money(charge.annual_amount)}")
             if line.rent_steps:
                 st.markdown("**Rent escalation schedule**")
                 st.dataframe(

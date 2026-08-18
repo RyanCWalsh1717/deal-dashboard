@@ -261,14 +261,17 @@ class EntityTrialBalance:
 
 @dataclass
 class ChargeLine:
-    """One current-period charge on a lease (e.g. base Rent, or a CAM
-    reimbursement) — the Tenancy Schedule export only ever labels these
-    "Rent" or "CAM"; it never splits CAM into its RE-Tax/Operating
-    components, so multiple CAM lines on one lease can't be told apart
-    beyond "not Rent" (see RentRollLine.current_annual_cam)."""
+    """One current-period charge on a lease (e.g. base Rent, or a recovery/
+    CAM reimbursement). Some Tenancy Schedule exports only label these with
+    a short code (e.g. "BRLAB") and a generic "Rent"/"CAM" charge_type, with
+    no way to tell apart multiple CAM lines beyond "not Rent"; newer exports
+    add a "Desc" column with a real description (e.g. "Recovery - Real
+    Estate Tax") — `description` holds that when present, else "" (see
+    RentRollLine.current_annual_cam, which only ever needed charge_type)."""
 
     charge_type: str
     annual_amount: float
+    description: str = ""
 
 
 @dataclass
@@ -302,7 +305,16 @@ class RentRollLine:
 
     @property
     def current_annual_cam(self) -> Optional[float]:
-        cam = [c.annual_amount for c in self.charges if c.charge_type.strip().upper() != "RENT"]
+        # A charge is the base-rent line if its charge_type is literally
+        # "Rent" (old-format exports) OR its description mentions "rent"
+        # (newer exports use a short code like "BRLAB" for charge_type, with
+        # the real wording — e.g. "Base Rent - Lab" — only in description).
+        def _is_rent(c: ChargeLine) -> bool:
+            if c.charge_type.strip().upper() == "RENT":
+                return True
+            return "rent" in c.description.lower()
+
+        cam = [c.annual_amount for c in self.charges if not _is_rent(c)]
         return sum(cam) if cam else None
 
     @property
