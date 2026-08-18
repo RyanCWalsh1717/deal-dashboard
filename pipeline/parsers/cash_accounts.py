@@ -101,10 +101,15 @@ def _parse_tb_as_of(ws) -> Optional[object]:
         v = row[0].value
         if isinstance(v, str) and v.strip().lower().startswith("period"):
             period_text = v.split("=", 1)[1].strip() if "=" in v else v.strip()
-            try:
-                return datetime.strptime(period_text, "%B %Y").date()
-            except ValueError:
-                pass
+            # Confirmed both forms appear across real exports of this same
+            # report: the May 2026 file says "May 2026" (full month name),
+            # the June 2026 file says "Jun 2026" (abbreviated) — try both
+            # rather than assume one is canonical.
+            for fmt in ("%B %Y", "%b %Y"):
+                try:
+                    return datetime.strptime(period_text, fmt).date()
+                except ValueError:
+                    continue
     return None
 
 

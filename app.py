@@ -16,6 +16,7 @@ if str(APP_DIR) not in sys.path:
 
 from pipeline import source_files
 from pipeline.models import PortfolioSummaryRow
+from pipeline.parsers.budget_comparison_report import parse_budget_comparison_report
 from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.distribution_workbook import parse_workbook
 from pipeline.parsers.rent_roll import parse_rent_roll
@@ -106,6 +107,22 @@ def _resolve_rent_roll_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple
     return (p, p.stat().st_mtime) if p else (None, None)
 
 
+@st.cache_data(show_spinner="Parsing budget comparison report...")
+def _cached_budget_comparison_report(path_str: str, mtime: float, property_code: str):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path_str, data_only=True)
+    ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    return parse_budget_comparison_report(ws, property_code)
+
+
+def _resolve_budget_comparison_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[Optional[Path], Optional[float]]:
+    if not period:
+        return None, None
+    p = source_files.resolve_period_file(cfg, period, "budget_comparison.xlsx", str(DATA_DIR))
+    return (p, p.stat().st_mtime) if p else (None, None)
+
+
 def _build_portfolio_row(cfg: PropertyConfig, result) -> PortfolioSummaryRow:
     total_cash = None
     total_debt = None
@@ -138,28 +155,34 @@ def _build_portfolio_row(cfg: PropertyConfig, result) -> PortfolioSummaryRow:
     )
 
 
-def _process_uploads(cfg: PropertyConfig, uploaded_files) -> Optional[str]:
-    """Classifies + saves every file in a batch upload; returns the newest
-    period touched (so the picker can jump straight to it), or None if
-    nothing was successfully saved."""
+def _process_uploads(cfg: PropertyConfig, uploaded_files) -> Tuple[Optional[str], list]:
+    """Classifies + saves every file in a batch upload; returns (newest
+    period touched, [(level, message), ...]). The messages are returned
+    rather than written directly via st.sidebar.warning/success because the
+    caller immediately triggers a st.rerun() to refresh the period picker —
+    messages emitted before that rerun are wiped before a user can read them,
+    so they need to be stashed in session_state and rendered on the next
+    run instead."""
     newest_period = None
+    messages = []
     for f in uploaded_files:
         data = f.getvalue()
         classified = source_files.classify_upload(data, f.name, cfg)
         if classified.file_type == "unknown" or not classified.period:
-            st.sidebar.warning(classified.error or f"Couldn't process {f.name}.")
+            messages.append(("warning", classified.error or f"Couldn't process {f.name}."))
             continue
         source_files.save_classified_upload(classified, data, cfg, str(DATA_DIR))
-        st.sidebar.success(f"{f.name} → {classified.file_type.replace('_', ' ')} ({classified.period})")
+        messages.append(("success", f"{f.name} → {classified.file_type.replace('_', ' ')} ({classified.period})"))
         if newest_period is None or classified.period > newest_period:
             newest_period = classified.period
-    return newest_period
+    return newest_period, messages
 
 
 def main() -> None:
     for key, default in {
         "selected_property": None,
         "upload_epoch": {},
+        "upload_messages": {},
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default
@@ -209,9 +232,13 @@ def main() -> None:
     with st.sidebar.expander("Update Source Files"):
         st.caption(
             "Drop in an updated distribution workbook, trial balance, rent roll, "
-            "or loan statement PDF(s) — each file is auto-detected by its "
-            "content and filed under the period it's dated as of."
+            "Yardi Budget Comparison report, or loan statement PDF(s) — each file "
+            "is auto-detected by its content and filed under the period it's "
+            "dated as of."
         )
+        for level, message in st.session_state.upload_messages.get(selected_code, []):
+            getattr(st, level)(message)
+
         epoch = st.session_state.upload_epoch.get(selected_code, 0)
         uploaded_files = st.file_uploader(
             "Files",
@@ -221,7 +248,8 @@ def main() -> None:
             label_visibility="collapsed",
         )
         if uploaded_files:
-            newest_period = _process_uploads(cfg, uploaded_files)
+            newest_period, messages = _process_uploads(cfg, uploaded_files)
+            st.session_state.upload_messages[selected_code] = messages
             if newest_period:
                 st.session_state.pending_period = newest_period
             st.session_state.upload_epoch[selected_code] = epoch + 1
@@ -244,6 +272,16 @@ def main() -> None:
             result = _cached_parse(str(path), mtime, cfg.property_code, str(DATA_DIR))
         except Exception as exc:
             st.error(f"Failed to parse workbook: {exc}")
+
+    if result is not None:
+        bc_path, bc_mtime = _resolve_budget_comparison_path(cfg, selected_period)
+        if bc_path is not None:
+            try:
+                bc_result = _cached_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
+                if bc_result.lines:
+                    result.budget_comparison = bc_result
+            except Exception as exc:
+                st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
 
     entity_trial_balances = []
     for path_str, tb_mtime in _discover_trial_balance_paths(cfg, selected_period).items():

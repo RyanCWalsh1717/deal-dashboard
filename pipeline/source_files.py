@@ -22,6 +22,7 @@ from typing import List, Optional
 import openpyxl
 
 from pipeline.parsers._shared import parse_as_of_date
+from pipeline.parsers.budget_comparison_report import is_budget_comparison_report, parse_period
 from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.rent_roll import parse_rent_roll
 from pipeline.parsers.waterfall import parse_distribution_waterfall
@@ -32,12 +33,13 @@ _PERIOD_RE = re.compile(r"^\d{4}-\d{2}$")
 _CANONICAL_NAMES = {
     "distribution_workbook": "distribution_workbook.xlsx",
     "rent_roll": "rent_roll.xlsx",
+    "budget_comparison": "budget_comparison.xlsx",
 }
 
 
 @dataclass
 class ClassifiedUpload:
-    file_type: str  # "distribution_workbook" | "trial_balance" | "rent_roll" | "loan_statement" | "unknown"
+    file_type: str  # "distribution_workbook" | "budget_comparison" | "trial_balance" | "rent_roll" | "loan_statement" | "unknown"
     period: Optional[str] = None  # "YYYY-MM"
     tranche_name: Optional[str] = None  # loan_statement only
     entity_code: Optional[str] = None  # trial_balance only — one TB per entity, several possible per period
@@ -87,6 +89,18 @@ def classify_upload(data: bytes, filename: str, cfg: PropertyConfig) -> Classifi
         return ClassifiedUpload(file_type="unknown", error=f'"{filename}" isn\'t a .xlsx or .pdf file.')
 
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+
+    first_ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    if is_budget_comparison_report(first_ws):
+        period = parse_period(first_ws)
+        return ClassifiedUpload(
+            file_type="budget_comparison",
+            period=_to_period(period),
+            error=None
+            if period
+            else f'"{filename}" looks like a Budget Comparison report, but no "Period = <Month Year>" '
+            "label was found.",
+        )
 
     if any(name in wb.sheetnames for name in cfg.sheet_map.values()):
         as_of = _workbook_as_of(cfg, wb)

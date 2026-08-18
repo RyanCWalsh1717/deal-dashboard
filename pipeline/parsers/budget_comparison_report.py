@@ -1,0 +1,87 @@
+"""Parses a standalone Yardi "Budget Comparison" GL report (single sheet,
+title cell literally reading "Budget Comparison") into a BudgetComparisonResult.
+
+This is a full chart-of-accounts dump (Income through Equity, every GL code)
+with a "Period = <Mon> <Year>" label and, per account, PTD Actual / PTD
+Budget / Variance / % Var / YTD Actual / YTD Budget / Variance / % Var /
+Annual columns (row 5 header) — richer than the distribution workbook's own
+internal Budget tab (see budget_vs_actual.py), which only carries a handful
+of P&L subtotals. Only the PTD Actual/PTD Budget columns are used here, to
+match the account-level "Detailed" view's existing single-period-comparison
+shape; YTD and Annual aren't consumed.
+
+Leaf GL lines have a numeric code in column 1 and real values in every
+numeric column. Section-header rows (e.g. "400000 INCOME") have no values at
+all; subtotal/rollup rows (e.g. "419999 TOTAL BASE RENT") do have values but
+their label always starts with "TOTAL" (real leaf labels are Title Case, e.g.
+"Rent - Lab") — confirmed directly against Budget_Comparison_Accrual (31).xlsx.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import date, datetime
+from typing import Optional
+
+from openpyxl.worksheet.worksheet import Worksheet
+
+from pipeline.models import BudgetComparisonResult, BudgetLine
+
+_TITLE_ROW = 2
+_PERIOD_ROW = 3
+_FIRST_DATA_ROW = 6
+_CODE_COL = 1
+_LABEL_COL = 2
+_PTD_ACTUAL_COL = 3
+_PTD_BUDGET_COL = 4
+
+_PERIOD_RE = re.compile(r"Period\s*=\s*([A-Za-z]+\s+\d{4})")
+
+
+def is_budget_comparison_report(ws: Worksheet) -> bool:
+    title = ws.cell(row=_TITLE_ROW, column=1).value
+    return isinstance(title, str) and title.strip().lower() == "budget comparison"
+
+
+def parse_period(ws: Worksheet) -> Optional[date]:
+    cell = ws.cell(row=_PERIOD_ROW, column=1).value
+    if not isinstance(cell, str):
+        return None
+    match = _PERIOD_RE.search(cell)
+    if not match:
+        return None
+    text = match.group(1)
+    for fmt in ("%B %Y", "%b %Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_budget_comparison_report(ws: Worksheet, property_code: str) -> BudgetComparisonResult:
+    period = parse_period(ws)
+    lines = []
+    for r in range(_FIRST_DATA_ROW, ws.max_row + 1):
+        code = ws.cell(row=r, column=_CODE_COL).value
+        label = ws.cell(row=r, column=_LABEL_COL).value
+        actual = ws.cell(row=r, column=_PTD_ACTUAL_COL).value
+        budget = ws.cell(row=r, column=_PTD_BUDGET_COL).value
+
+        if not isinstance(code, str) or not code.strip().isdigit():
+            continue
+        if not isinstance(label, str) or not label.strip() or label.strip().upper().startswith("TOTAL"):
+            continue
+        if not isinstance(actual, (int, float)) or not isinstance(budget, (int, float)):
+            continue
+
+        lines.append(
+            BudgetLine(
+                account_code=code.strip(),
+                account_label=label.strip(),
+                budget_value=float(budget),
+                actual_value=float(actual),
+            )
+        )
+
+    return BudgetComparisonResult(property_code=property_code, period=period, lines=lines)
