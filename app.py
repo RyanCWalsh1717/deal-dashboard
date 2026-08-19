@@ -17,9 +17,16 @@ if str(APP_DIR) not in sys.path:
 from pipeline import source_files
 from pipeline.models import BudgetLine, PortfolioSummaryRow
 from pipeline.parsers.budget_comparison_report import (
+    PTD_ACTUAL_COL,
+    PTD_BUDGET_COL,
+    YTD_ACTUAL_COL,
+    YTD_BUDGET_COL,
+    boma_rollup,
     parse_annual_budget_totals,
     parse_budget_comparison_report,
     parse_opex_categories,
+    parse_ytd_annual_budget_totals,
+    parse_ytd_budget_comparison_report,
 )
 from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.distribution_workbook import parse_workbook
@@ -130,12 +137,30 @@ def _cached_annual_budget_totals(path_str: str, mtime: float):
 
 
 @st.cache_data(show_spinner="Parsing budget comparison report...")
-def _cached_opex_categories(path_str: str, mtime: float):
+def _cached_opex_categories(path_str: str, mtime: float, value_col: Optional[int] = None):
     import openpyxl
 
     wb = openpyxl.load_workbook(path_str, data_only=True)
     ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
-    return parse_opex_categories(ws)
+    return parse_opex_categories(ws) if value_col is None else parse_opex_categories(ws, value_col=value_col)
+
+
+@st.cache_data(show_spinner="Parsing budget comparison report...")
+def _cached_ytd_annual_budget_totals(path_str: str, mtime: float):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path_str, data_only=True)
+    ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    return parse_ytd_annual_budget_totals(ws)
+
+
+@st.cache_data(show_spinner="Parsing budget comparison report...")
+def _cached_ytd_budget_comparison_report(path_str: str, mtime: float, property_code: str):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path_str, data_only=True)
+    ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    return parse_ytd_budget_comparison_report(ws, property_code)
 
 
 def _resolve_budget_comparison_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[Optional[Path], Optional[float]]:
@@ -343,12 +368,11 @@ If a file gets rejected, the message right above the uploader explains why (usua
 - **Balance Sheet** — full balance sheet per entity, from the distribution workbook's equity tabs.
 - **Rent Roll** — occupancy, lease terms, current rent/CAM, and upcoming rent steps per suite.
 - **Debt & Loans** — forecast (distribution workbook) vs. actual (loan statements) balances and rates, side by side.
-- **Reconciliation** — cross-checks each uploaded trial balance's own figures (AR/AP/mortgage/cash) against the other source files that should describe the same real-world numbers.
 - **Distribution Waterfall** — the JV distribution calc per ownership tier.
-- **Budget vs. Actuals** — Summary (P&L rollup) and Detailed (account-level) budget-to-actual, for the selected month.
-- **Annual Budget** — full-year budget vs. year-to-date actual.
+- **Budget vs. Actuals** — two toggles: Period-to-Date (the selected month) vs. Year-to-Date, and Summary (P&L rollup, plus a BOMA-category OpEx breakdown) vs. Detailed (account-level). Year-to-Date also shows a Reforecast column (the distribution workbook's own current-year figure) alongside Kardin's once-per-year Annual Budget.
 - **Hold/Sell Assumptions** — see below.
 - **Sources & Uses** / **Leasing & Investment Outlook** — placeholders until the leasing/investment model is finalized.
+- **Reconciliation** — cross-checks each uploaded trial balance's own figures (AR/AP/mortgage/cash) against the other source files that should describe the same real-world numbers; flags anything off by more than a small tolerance (could just be a timing difference between files).
 
 **Hold/Sell Assumptions**
 This section holds the inputs for the property's hold/sell model (inflation, vacancy, market leasing terms, cap rate, hold period, refinance) so anyone can view or change them without opening Excel. **Save Assumptions** persists them for next time. **Download Excel Model** produces a fresh workbook with those assumptions plus the latest real data (rent roll, actuals, debt, equity) already filled in — all the actual math (rollover schedule, debt amortization, IRR) lives in that workbook's own formulas, not in the app, so the exported file is always the authoritative calculation.
@@ -374,6 +398,7 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
             st.error(f"Failed to parse workbook: {exc}")
 
     opex_categories: dict = {}
+    boma_opex: dict = {}
     if result is not None:
         bc_path, bc_mtime = _resolve_budget_comparison_path(cfg, selected_period)
         if bc_path is not None:
@@ -388,13 +413,31 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
                         BudgetLine(
                             account_code=line.account_code,
                             account_label=line.account_label,
+                            # Kardin's static once-per-year budget replaces budget_value; the
+                            # distribution workbook's own figure it displaces is kept as the
+                            # live reforecast, not discarded.
                             budget_value=annual_totals.get(line.account_code, line.budget_value),
                             actual_value=line.actual_value,
+                            reforecast_value=line.budget_value,
                         )
                         for line in result.annual_budget_summary.lines
                     ]
 
+                ytd_detail = _cached_ytd_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
+                if ytd_detail.lines:
+                    result.annual_budget_detail = ytd_detail
+
                 opex_categories = _cached_opex_categories(str(bc_path), bc_mtime)
+                boma_opex = {
+                    "ptd": {
+                        "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_ACTUAL_COL)),
+                        "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_BUDGET_COL)),
+                    },
+                    "ytd": {
+                        "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_ACTUAL_COL)),
+                        "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_BUDGET_COL)),
+                    },
+                }
             except Exception as exc:
                 st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
 
@@ -431,7 +474,8 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
             st.error(f"Failed to parse rent roll: {exc}")
 
     render_property_detail(
-        cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR), opex_categories
+        cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR),
+        opex_categories, boma_opex,
     )
 
 

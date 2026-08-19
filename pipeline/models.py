@@ -170,6 +170,11 @@ class BudgetLine:
     account_label: str
     budget_value: Optional[float]
     actual_value: Optional[float]
+    # Only populated on annual/YTD lines: the distribution workbook's own current-year
+    # Budget-tab figure, BEFORE it gets overwritten by the Budget Comparison report's
+    # static original annual budget — i.e. the property's live reforecast, distinct from
+    # the once-set-per-year Kardin budget that `budget_value` becomes for those lines.
+    reforecast_value: Optional[float] = None
 
     @property
     def variance_dollar(self) -> Optional[float]:
@@ -217,6 +222,7 @@ class DistributionWorkbookResult:
     budget_comparison: Optional[BudgetComparisonResult] = None
     budget_summary: Optional[BudgetComparisonResult] = None
     annual_budget_summary: Optional[BudgetComparisonResult] = None
+    annual_budget_detail: Optional[BudgetComparisonResult] = None
 
 
 @dataclass

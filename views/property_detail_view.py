@@ -1,7 +1,8 @@
 """Property detail view: Summary / Cash / Equity & Capital / Debt & Loans /
 Distribution Waterfall (per-tier tabs, each with Current + Stabilized) /
-Budget vs. Actuals (Summary + Detailed) / Sources & Uses (placeholder) /
-Leasing & Investment Outlook (placeholder).
+Budget vs. Actuals (Period-to-Date + Year-to-Date, each with Summary +
+Detailed) / Sources & Uses (placeholder) / Leasing & Investment Outlook
+(placeholder) / Reconciliation.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from pipeline.models import (
 )
 from pipeline import holdsell_model
 from pipeline.parsers.abstract_loader import load_jv_abstract, load_loan_abstract
+from pipeline.parsers.budget_comparison_report import BOMA_CATEGORY_ORDER
 from pipeline.property_config import PropertyConfig
 from views.branding import render_hero, render_kpi_tiles
 
@@ -99,6 +101,25 @@ def _total_cash_all_sources(
     return sum(values) if values else None
 
 
+def _variance_flag(value_a: Optional[float], value_b: Optional[float], rel_threshold: float = 0.005, abs_floor: float = 500.0) -> Optional[str]:
+    """Flags two figures that should describe the same real-world balance but
+    differ by more than a small tolerance (relative, with an absolute floor
+    so tiny accounts don't get flagged on rounding alone). A flag doesn't
+    mean something's wrong — a timing gap between two source files' as-of
+    dates is a common, benign cause — just that it's worth a look."""
+    if value_a is None or value_b is None:
+        return None
+    variance = value_a - value_b
+    base = max(abs(value_a), abs(value_b))
+    if base == 0 or abs(variance) < abs_floor:
+        return None
+    pct = abs(variance) / base
+    if pct < rel_threshold:
+        return None
+    direction = "higher" if variance > 0 else "lower"
+    return f"${abs(variance):,.0f} ({pct * 100:.1f}%) {direction} than expected — could be a timing difference between source files, or worth a closer look."
+
+
 def _current_debt(
     result: Optional[DistributionWorkbookResult], loan_statements: List[LoanStatement]
 ) -> tuple:
@@ -123,13 +144,12 @@ SECTIONS = [
     "Balance Sheet",
     "Rent Roll",
     "Debt & Loans",
-    "Reconciliation",
     "Distribution Waterfall",
     "Budget vs. Actuals",
-    "Annual Budget",
     "Hold/Sell Assumptions",
     "Sources & Uses",
     "Leasing & Investment Outlook",
+    "Reconciliation",
 ]
 
 
@@ -155,11 +175,13 @@ def render_property_detail(
     entity_trial_balances: Optional[List[EntityTrialBalance]] = None,
     data_dir: str = "data",
     opex_categories: Optional[dict] = None,
+    boma_opex: Optional[dict] = None,
 ) -> None:
     cash_accounts = cash_accounts or []
     loan_statements = loan_statements or []
     entity_trial_balances = entity_trial_balances or []
     opex_categories = opex_categories or {}
+    boma_opex = boma_opex or {}
 
     badges = [b for b in [cfg.market, cfg.property_type] if b]
     render_hero(cfg.display(), cfg.property_address, badges, photo_code=cfg.property_code)
@@ -198,9 +220,7 @@ def render_property_detail(
     elif section == "Distribution Waterfall":
         _render_waterfall(cfg, result)
     elif section == "Budget vs. Actuals":
-        _render_budget(result)
-    elif section == "Annual Budget":
-        _render_annual_budget(result)
+        _render_budget(result, boma_opex)
     elif section == "Hold/Sell Assumptions":
         _render_holdsell_assumptions(cfg, result, rent_roll, loan_statements, entity_trial_balances, data_dir, opex_categories)
     elif section == "Sources & Uses":
@@ -642,7 +662,7 @@ def _render_debt(
                 if abstract:
                     st.json(abstract)
                 else:
-                    st.caption("No abstract on file yet — run `tools/extract_loan_abstract.py`.")
+                    st.caption("No abstract on file yet — abstracts are generated once, offline, from the full loan/JV agreement, not by anything in this app yet.")
 
 
 def _match_ownership_tier(cfg: PropertyConfig, entity_name: str):
@@ -712,6 +732,9 @@ def _render_reconciliation(
                 hide_index=True,
                 column_config={"Balance": _money_col()},
             )
+            flag = _variance_flag(entity.mortgage_payable, loan_total)
+            if flag:
+                st.warning(f"Mortgage Payable variance flagged: {flag}", icon="⚠️")
         elif entity.mortgage_payable is not None:
             st.caption("Mortgage Payable is on file, but no loan statements are loaded yet to cross-check against.")
         else:
@@ -742,6 +765,12 @@ def _render_reconciliation(
         if not loan_statements:
             st.caption("No loan statements loaded yet to cross-check cash/escrow balances against.")
         elif escrow_rows:
+            flagged_accounts = []
+            for row in escrow_rows:
+                flag = _variance_flag(row["Trial Balance"], row["Loan Statement"])
+                row["Flag"] = "Review" if flag else ""
+                if flag:
+                    flagged_accounts.append((row["Account"], flag))
             st.dataframe(
                 pd.DataFrame(escrow_rows),
                 width="stretch",
@@ -752,6 +781,8 @@ def _render_reconciliation(
                     "Variance": _money_col(),
                 },
             )
+            for account, flag in flagged_accounts:
+                st.warning(f"{account} variance flagged: {flag}", icon="⚠️")
         else:
             st.caption("No escrow/reserve accounts in this trial balance matched a loan statement's escrow fields.")
 
@@ -770,6 +801,8 @@ def _render_reconciliation(
             wf_tier = result.waterfall.tiers[matched_tier.tier_id]
             wf_contrib = sum(inv.contributions_to_date or 0.0 for inv in wf_tier.investors)
             wf_dist = sum(abs(inv.distributions_to_date or 0.0) for inv in wf_tier.investors)
+            contrib_flag = _variance_flag(entity.contributions, wf_contrib)
+            dist_flag = _variance_flag(entity.distributions, wf_dist)
             st.dataframe(
                 pd.DataFrame(
                     [
@@ -778,12 +811,14 @@ def _render_reconciliation(
                             "Trial Balance": entity.contributions,
                             "Waterfall (to date)": wf_contrib,
                             "Variance": (entity.contributions or 0.0) - wf_contrib,
+                            "Flag": "Review" if contrib_flag else "",
                         },
                         {
                             "Metric": "Distributions",
                             "Trial Balance": entity.distributions,
                             "Waterfall (to date)": wf_dist,
                             "Variance": (entity.distributions or 0.0) - wf_dist,
+                            "Flag": "Review" if dist_flag else "",
                         },
                     ]
                 ),
@@ -796,6 +831,10 @@ def _render_reconciliation(
                 },
             )
             st.caption(f'Matched to the "{matched_tier.label()}" tier ({matched_tier.distributing_entity}).')
+            if contrib_flag:
+                st.warning(f"Contributions variance flagged: {contrib_flag}", icon="⚠️")
+            if dist_flag:
+                st.warning(f"Distributions variance flagged: {dist_flag}", icon="⚠️")
 
         st.divider()
 
@@ -891,107 +930,175 @@ def _render_waterfall(cfg: PropertyConfig, result: Optional[DistributionWorkbook
                 if abstract:
                     st.json(abstract)
                 else:
-                    st.caption("No abstract on file yet — run `tools/extract_loan_abstract.py`.")
+                    st.caption("No abstract on file yet — abstracts are generated once, offline, from the full loan/JV agreement, not by anything in this app yet.")
 
 
-def _budget_lines_df(lines, label_fn) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Account": label_fn(line),
-                "Budget": line.budget_value,
-                "Actual": line.actual_value,
-                "Variance $": line.variance_dollar,
-                "Variance %": _pct100(line.variance_pct),
-                "Missing": line.missing_side or "",
-            }
-            for line in lines
-        ]
-    )
+def _budget_lines_df(lines, label_fn, show_reforecast: bool = False) -> pd.DataFrame:
+    rows = []
+    for line in lines:
+        row = {
+            "Account": label_fn(line),
+            "Budget": line.budget_value,
+            "Actual": line.actual_value,
+            "Variance $": line.variance_dollar,
+            "Variance %": _pct100(line.variance_pct),
+            "Missing": line.missing_side or "",
+        }
+        if show_reforecast:
+            row["Reforecast"] = line.reforecast_value
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
-def _budget_column_config():
-    return {
+def _budget_column_config(show_reforecast: bool = False):
+    config = {
         "Budget": _money_col(),
         "Actual": _money_col(),
         "Variance $": _money_col(),
         "Variance %": _pct_col(),
     }
+    if show_reforecast:
+        config["Reforecast"] = _money_col()
+    return config
 
 
-def _render_budget(result: Optional[DistributionWorkbookResult]) -> None:
-    if not result or not result.budget_comparison:
+def _boma_df(actual_cats: dict, budget_cats: dict) -> pd.DataFrame:
+    rows = []
+    for category in BOMA_CATEGORY_ORDER:
+        a = actual_cats.get(category)
+        b = budget_cats.get(category)
+        if a is None and b is None:
+            continue
+        rows.append(
+            {
+                "Category": category,
+                "Budget": b,
+                "Actual": a,
+                "Variance $": (a - b) if (a is not None and b is not None) else None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_boma_breakdown(boma_period: dict) -> None:
+    actual = (boma_period or {}).get("actual") or {}
+    budget = (boma_period or {}).get("budget") or {}
+    if not actual and not budget:
+        return
+    st.markdown("**Operating Expenses by BOMA Category**")
+    st.dataframe(
+        _boma_df(actual, budget),
+        width="stretch",
+        hide_index=True,
+        column_config={"Budget": _money_col(), "Actual": _money_col(), "Variance $": _money_col()},
+    )
+    st.caption(
+        "Recoverable OpEx only, from the Budget Comparison report's own category subtotals — see "
+        "BOMA_CATEGORY_MAP in pipeline/parsers/budget_comparison_report.py for the mapping (edit "
+        "there if categories should group differently). Non-recoverable OpEx (~$43K) stays folded "
+        "into the single \"Expenses\" line above rather than broken out further."
+    )
+
+
+def _render_budget(result: Optional[DistributionWorkbookResult], boma_opex: Optional[dict] = None) -> None:
+    boma_opex = boma_opex or {}
+    if not result or (not result.budget_comparison and not result.annual_budget_summary):
         st.info("No budget comparison data available.")
         return
 
-    period = result.budget_comparison.period
-    if period:
-        st.caption(f"Period: {period.strftime('%B %Y')} (last month the Cash Flow tab labels as Actuals)")
+    period_options = ["Period-to-Date", "Year-to-Date"]
+    if "budget_period" not in st.session_state or st.session_state.budget_period not in period_options:
+        st.session_state.budget_period = period_options[0]
+    period_choice = st.segmented_control("Period", period_options, key="budget_period")
+    if period_choice is None:
+        st.session_state.budget_period = period_options[0]
+        period_choice = period_options[0]
 
-    budget_subtabs = ["Summary", "Detailed"]
-    if "budget_subtab" not in st.session_state or st.session_state.budget_subtab not in budget_subtabs:
-        st.session_state.budget_subtab = budget_subtabs[0]
-    sub = st.segmented_control("View", budget_subtabs, key="budget_subtab")
-    if sub is None:
-        st.session_state.budget_subtab = budget_subtabs[0]
-        sub = budget_subtabs[0]
+    view_options = ["Summary", "Detailed"]
+    if "budget_subtab" not in st.session_state or st.session_state.budget_subtab not in view_options:
+        st.session_state.budget_subtab = view_options[0]
+    view_choice = st.segmented_control("View", view_options, key="budget_subtab")
+    if view_choice is None:
+        st.session_state.budget_subtab = view_options[0]
+        view_choice = view_options[0]
 
-    if sub == "Summary":
-        if not result.budget_summary or not result.budget_summary.lines:
-            st.info("No P&L summary available.")
-        else:
+    if period_choice == "Year-to-Date":
+        if not result.annual_budget_summary or not result.annual_budget_summary.lines:
+            st.info("No annual budget comparison available.")
+            return
+        ytd_through = result.annual_budget_summary.period
+        if ytd_through:
+            st.caption(
+                f"Annual Budget = full-year {ytd_through.year} budget (Kardin, set once per year). "
+                "Reforecast = the distribution workbook's own current-year figure for the same "
+                f"period. YTD Actual = January through {ytd_through.strftime('%B %Y')} (the last "
+                "month the Cash Flow tab labels as Actuals)."
+            )
+        if view_choice == "Summary":
             st.dataframe(
-                _budget_lines_df(result.budget_summary.lines, lambda line: line.account_label),
+                _budget_lines_df(result.annual_budget_summary.lines, lambda line: line.account_label, show_reforecast=True),
                 width="stretch",
                 hide_index=True,
-                column_config=_budget_column_config(),
+                column_config=_budget_column_config(show_reforecast=True),
             )
             st.caption(
-                "Expenses/NOI/Cash Flow after Debt and Capital are computed on the budget side "
-                "(the Budget tab splits expenses into Recoverable/Non-Recoverable rather than one "
-                "lump total) — same formula order the Cash Flow tab itself uses. Net Income comes "
-                "from the distribution file's trailing-12-month Net Income row, actual only — that "
-                "row has no forward/budget-scenario values, so there's no budget-side figure to show."
+                "Capital Expenditures and Cash Flow after Debt Service aren't in the Period-to-Date "
+                "view — added here to match the full-year waterfall Ryan's own Kardin budget report "
+                "uses (Income → OpEx → NOI → Debt Service → CapEx). Net Income is left out: it's a "
+                "trailing-12-month actual-only figure, a different concept from a January-through-YTD sum."
             )
-    else:
-        if not result.budget_comparison.lines:
-            st.info("No account-level budget comparison available.")
+            _render_boma_breakdown(boma_opex.get("ytd"))
         else:
-            st.dataframe(
-                _budget_lines_df(
-                    result.budget_comparison.lines,
-                    lambda line: f"{line.account_code} — {line.account_label}",
-                ),
-                width="stretch",
-                hide_index=True,
-                column_config=_budget_column_config(),
-            )
-
-
-def _render_annual_budget(result: Optional[DistributionWorkbookResult]) -> None:
-    if not result or not result.annual_budget_summary or not result.annual_budget_summary.lines:
-        st.info("No annual budget comparison available.")
-        return
-
-    ytd_through = result.annual_budget_summary.period
-    if ytd_through:
-        st.caption(
-            f"Annual Budget = full-year {ytd_through.year} budget. YTD Actual = January "
-            f"through {ytd_through.strftime('%B %Y')} (the last month the Cash Flow tab labels "
-            "as Actuals)."
-        )
-    st.dataframe(
-        _budget_lines_df(result.annual_budget_summary.lines, lambda line: line.account_label),
-        width="stretch",
-        hide_index=True,
-        column_config=_budget_column_config(),
-    )
-    st.caption(
-        "Capital Expenditures and Cash Flow after Debt Service aren't in the monthly Budget vs. "
-        "Actuals view — added here to match the full-year waterfall Ryan's own Kardin budget "
-        "report uses (Income → OpEx → NOI → Debt Service → CapEx). Net Income is left out: it's a "
-        "trailing-12-month actual-only figure, a different concept from a January-through-YTD sum."
-    )
+            if not result.annual_budget_detail or not result.annual_budget_detail.lines:
+                st.info("No account-level year-to-date comparison available.")
+            else:
+                st.dataframe(
+                    _budget_lines_df(
+                        result.annual_budget_detail.lines,
+                        lambda line: f"{line.account_code} — {line.account_label}",
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_budget_column_config(),
+                )
+    else:
+        if not result.budget_comparison:
+            st.info("No budget comparison data available.")
+            return
+        period = result.budget_comparison.period
+        if period:
+            st.caption(f"Period: {period.strftime('%B %Y')} (last month the Cash Flow tab labels as Actuals)")
+        if view_choice == "Summary":
+            if not result.budget_summary or not result.budget_summary.lines:
+                st.info("No P&L summary available.")
+            else:
+                st.dataframe(
+                    _budget_lines_df(result.budget_summary.lines, lambda line: line.account_label),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_budget_column_config(),
+                )
+                st.caption(
+                    "Expenses/NOI/Cash Flow after Debt and Capital are computed on the budget side "
+                    "(the Budget tab splits expenses into Recoverable/Non-Recoverable rather than one "
+                    "lump total) — same formula order the Cash Flow tab itself uses. Net Income comes "
+                    "from the distribution file's trailing-12-month Net Income row, actual only — that "
+                    "row has no forward/budget-scenario values, so there's no budget-side figure to show."
+                )
+                _render_boma_breakdown(boma_opex.get("ptd"))
+        else:
+            if not result.budget_comparison.lines:
+                st.info("No account-level budget comparison available.")
+            else:
+                st.dataframe(
+                    _budget_lines_df(
+                        result.budget_comparison.lines,
+                        lambda line: f"{line.account_code} — {line.account_label}",
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=_budget_column_config(),
+                )
 
 
 def _render_holdsell_assumptions(
