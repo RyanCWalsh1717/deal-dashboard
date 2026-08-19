@@ -19,6 +19,9 @@ yardi_codes:
   - revlabpm
   - revlabvn
   - bh1050jv
+  - revlabs  # development-phase entity, confirmed by Ryan 2026-08-18 — distinct from
+             # revlabpm (property) and revlabvn (venture); lets its TB be recognized
+             # and stored via the same multi-entity pipeline once dropped in
 
 # "2026 Budget" (with space) chosen as canonical over "2026Budget" — wider column
 # range (AF vs S) suggests it's the more complete/current version. Revisit if Ryan

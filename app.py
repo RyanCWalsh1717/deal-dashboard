@@ -309,6 +309,39 @@ def main() -> None:
                     source_files.delete_period(cfg, reset_period, str(DATA_DIR))
                     st.rerun()
 
+    with st.sidebar.expander("How to Use"):
+        st.markdown(
+            """
+**Views**
+- **Portfolio** — every active property, one row each, with headline cash/debt/distribution figures.
+- **Property Detail** — everything for one property. Pick it from the **Property** dropdown, then pick a month/quarter from **Viewing Period**.
+
+**Uploading files**
+Drop files into **Update Source Files** — each one is auto-detected by its content (not its filename), so you don't need to sort them first. Drop as many as you want at once. Recognized types: distribution workbook, trial balance (one file per entity — e.g. property, venture, co-GP), rent roll, Yardi Budget Comparison report, and loan servicer statement PDFs. A file is filed under whatever period it's dated as of — if a type isn't re-uploaded in a given month, the app shows the last known version instead of going blank.
+
+If a file gets rejected, the message right above the uploader explains why (usually "couldn't find an as-of date" or "doesn't look like any known file type") — it stays on screen until the next upload.
+
+**Removing a file** — open **Reset Source Files**, pick the period, and either remove one file or clear the whole period. Each action needs you to type the exact file/period name first — deletes can't be undone from here.
+
+**Sections** (the pills below the property header)
+- **Summary** — the one-glance view: cash, NOI, debt, occupancy, with jump links into the detail sections.
+- **Cash** — every cash/escrow/reserve account, by source.
+- **Equity & Capital** — contributions, distributions, and capital balances per entity.
+- **Balance Sheet** — full balance sheet per entity, from the distribution workbook's equity tabs.
+- **Rent Roll** — occupancy, lease terms, current rent/CAM, and upcoming rent steps per suite.
+- **Debt & Loans** — forecast (distribution workbook) vs. actual (loan statements) balances and rates, side by side.
+- **Reconciliation** — cross-checks each uploaded trial balance's own figures (AR/AP/mortgage/cash) against the other source files that should describe the same real-world numbers.
+- **Distribution Waterfall** — the JV distribution calc per ownership tier.
+- **Budget vs. Actuals** — Summary (P&L rollup) and Detailed (account-level) budget-to-actual, for the selected month.
+- **Annual Budget** — full-year budget vs. year-to-date actual.
+- **Hold/Sell Assumptions** — see below.
+- **Sources & Uses** / **Leasing & Investment Outlook** — placeholders until the leasing/investment model is finalized.
+
+**Hold/Sell Assumptions**
+This section holds the inputs for the property's hold/sell model (inflation, vacancy, market leasing terms, cap rate, hold period, refinance) so anyone can view or change them without opening Excel. **Save Assumptions** persists them for next time. **Download Excel Model** produces a fresh workbook with those assumptions plus the latest real data (rent roll, actuals, debt, equity) already filled in — all the actual math (rollover schedule, debt amortization, IRR) lives in that workbook's own formulas, not in the app, so the exported file is always the authoritative calculation.
+"""
+        )
+
     if not periods:
         st.info(
             f"No source files yet for **{cfg.display()}**. Use “Update Source Files” "
