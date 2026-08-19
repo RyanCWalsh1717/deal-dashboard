@@ -120,6 +120,41 @@ def parse_annual_budget_totals(ws: Worksheet) -> dict:
     return totals
 
 
+# The report's own recoverable-OpEx subtotal rows — confirmed these 13 sum to
+# exactly the "TOTAL OPERATING EXPENSES - RECOVERABLE" figure ($6,327,494.49
+# against Budget_Comparison_Accrual (31).xlsx), so they fully account for it
+# with no leftover/uncategorized bucket. Non-recoverable OpEx (~$43K) stays a
+# single line elsewhere — small, and not asked to be broken out further.
+OPEX_CATEGORY_LABELS = {
+    "cleaning_janitorial": "TOTAL CLEANING/JANITORIAL",
+    "utilities": "TOTAL UTILITIES",
+    "general_repairs_maintenance": "TOTAL GENERAL REPAIRS & MAINTENANCE",
+    "hvac_maintenance": "TOTAL HVAC MAINTENANCE",
+    "plumbing": "TOTAL PLUMBING",
+    "electrical_maintenance": "TOTAL ELECTRICAL MAINTENANCE",
+    "security_fire_life_safety": "TOTAL SECURITY / FIRE / LIFE SAFETY",
+    "elevator_maintenance": "TOTAL ELEVATOR MAINTENANCE",
+    "landscaping": "TOTAL LANDSCAPING",
+    "parking_garage_maintenance": "TOTAL PARKING AND GARAGE MAINTENANCE",
+    "administrative": "TOTAL ADMINISTRATIVE",
+    "insurance": "TOTAL INSURANCE",
+    "real_estate_taxes": "TOTAL REAL ESTATE TAXES",
+}
+
+
+def parse_opex_categories(ws: Worksheet) -> dict:
+    """Reads the Annual-column value off each recoverable-OpEx category
+    subtotal row (see OPEX_CATEGORY_LABELS). Returns whatever subset is
+    found, keyed by our internal category name — callers decide what to do
+    with a partial result (same convention as parse_annual_budget_totals())."""
+    categories = {}
+    for key, label in OPEX_CATEGORY_LABELS.items():
+        value = _find_label_value(ws, label)
+        if value is not None:
+            categories[key] = value
+    return categories
+
+
 def parse_budget_comparison_report(ws: Worksheet, property_code: str) -> BudgetComparisonResult:
     period = parse_period(ws)
     lines = []

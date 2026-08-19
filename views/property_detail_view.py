@@ -154,10 +154,12 @@ def render_property_detail(
     loan_statements: Optional[List[LoanStatement]] = None,
     entity_trial_balances: Optional[List[EntityTrialBalance]] = None,
     data_dir: str = "data",
+    opex_categories: Optional[dict] = None,
 ) -> None:
     cash_accounts = cash_accounts or []
     loan_statements = loan_statements or []
     entity_trial_balances = entity_trial_balances or []
+    opex_categories = opex_categories or {}
 
     badges = [b for b in [cfg.market, cfg.property_type] if b]
     render_hero(cfg.display(), cfg.property_address, badges, photo_code=cfg.property_code)
@@ -200,7 +202,7 @@ def render_property_detail(
     elif section == "Annual Budget":
         _render_annual_budget(result)
     elif section == "Hold/Sell Assumptions":
-        _render_holdsell_assumptions(cfg, result, rent_roll, loan_statements, entity_trial_balances, data_dir)
+        _render_holdsell_assumptions(cfg, result, rent_roll, loan_statements, entity_trial_balances, data_dir, opex_categories)
     elif section == "Sources & Uses":
         st.info(
             "Sources & Uses will populate once the leasing/investment outlook model is finalized — "
@@ -999,7 +1001,9 @@ def _render_holdsell_assumptions(
     loan_statements: List[LoanStatement],
     entity_trial_balances: List[EntityTrialBalance],
     data_dir: str,
+    opex_categories: Optional[dict] = None,
 ) -> None:
+    opex_categories = opex_categories or {}
     st.caption(
         "Assumptions here drive the Hold/Sell Excel model — edit and save them below, then "
         "download a fresh copy of the workbook with these values and the latest real data baked "
@@ -1036,8 +1040,33 @@ def _render_holdsell_assumptions(
                 else:  # dollar
                     val = st.number_input(f"{label}", value=stored, step=1000.0, format="%.0f", key=f"hs_{key}")
                     new_values[key] = val
+
+        st.markdown("**SOFR Curve (Monthly)**")
+        st.caption(
+            "Optional — leave a month blank to fall back to the derived Current SOFR. Paste in a "
+            "real forward curve here if you have one; it round-trips into every future export."
+        )
+        stored_curve = current.get("sofr_curve") or [None] * holdsell_model.N_MONTHS
+        curve_df = pd.DataFrame(
+            {
+                "Month": list(range(1, holdsell_model.N_MONTHS + 1)),
+                "SOFR %": [v * 100 if v is not None else None for v in stored_curve],
+            }
+        )
+        edited_curve = st.data_editor(
+            curve_df,
+            key="hs_sofr_curve",
+            hide_index=True,
+            disabled=["Month"],
+            column_config={"SOFR %": st.column_config.NumberColumn(format="%.2f", step=0.01)},
+            height=200,
+        )
+
         saved = st.form_submit_button("Save Assumptions")
         if saved:
+            new_values["sofr_curve"] = [
+                (v / 100) if v is not None and not pd.isna(v) else None for v in edited_curve["SOFR %"]
+            ]
             holdsell_model.save_assumptions(cfg, new_values, data_dir)
             st.success("Assumptions saved.")
             current = new_values
@@ -1048,7 +1077,9 @@ def _render_holdsell_assumptions(
         return
 
     try:
-        wb = holdsell_model.build_workbook(cfg, result, rent_roll, loan_statements, entity_trial_balances, current)
+        wb = holdsell_model.build_workbook(
+            cfg, result, rent_roll, loan_statements, entity_trial_balances, current, opex_categories
+        )
         buf = io.BytesIO()
         wb.save(buf)
         st.download_button(

@@ -16,7 +16,11 @@ if str(APP_DIR) not in sys.path:
 
 from pipeline import source_files
 from pipeline.models import BudgetLine, PortfolioSummaryRow
-from pipeline.parsers.budget_comparison_report import parse_annual_budget_totals, parse_budget_comparison_report
+from pipeline.parsers.budget_comparison_report import (
+    parse_annual_budget_totals,
+    parse_budget_comparison_report,
+    parse_opex_categories,
+)
 from pipeline.parsers.cash_accounts import parse_entity_trial_balance, parse_loan_statement
 from pipeline.parsers.distribution_workbook import parse_workbook
 from pipeline.parsers.rent_roll import parse_rent_roll
@@ -123,6 +127,15 @@ def _cached_annual_budget_totals(path_str: str, mtime: float):
     wb = openpyxl.load_workbook(path_str, data_only=True)
     ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
     return parse_annual_budget_totals(ws)
+
+
+@st.cache_data(show_spinner="Parsing budget comparison report...")
+def _cached_opex_categories(path_str: str, mtime: float):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path_str, data_only=True)
+    ws = wb["Report1"] if "Report1" in wb.sheetnames else wb.worksheets[0]
+    return parse_opex_categories(ws)
 
 
 def _resolve_budget_comparison_path(cfg: PropertyConfig, period: Optional[str]) -> Tuple[Optional[Path], Optional[float]]:
@@ -360,6 +373,7 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
         except Exception as exc:
             st.error(f"Failed to parse workbook: {exc}")
 
+    opex_categories: dict = {}
     if result is not None:
         bc_path, bc_mtime = _resolve_budget_comparison_path(cfg, selected_period)
         if bc_path is not None:
@@ -379,6 +393,8 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
                         )
                         for line in result.annual_budget_summary.lines
                     ]
+
+                opex_categories = _cached_opex_categories(str(bc_path), bc_mtime)
             except Exception as exc:
                 st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
 
@@ -414,7 +430,9 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
         except Exception as exc:
             st.error(f"Failed to parse rent roll: {exc}")
 
-    render_property_detail(cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR))
+    render_property_detail(
+        cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR), opex_categories
+    )
 
 
 if not check_password():
