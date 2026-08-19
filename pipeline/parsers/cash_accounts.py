@@ -82,6 +82,10 @@ def loan_statement_cash_accounts(stmt: LoanStatement) -> List[CashAccountBalance
 
 
 _ENTITY_HEADER_RE = re.compile(r"Property\s*=\s*(\S+)")
+# Newer Yardi trial balance exports (confirmed 2026-08-19 against real revlabpm/revlabvn/
+# revlabs/bh1050jv files) use "Entity Name (code)" as the entity-block header instead of
+# "Property = code ...". Both forms are handled — see _parse_entity_header() below.
+_ENTITY_NAME_CODE_RE = re.compile(r"^(?P<name>.+?)\s*\((?P<code>[^)]+)\)\s*$")
 _CASH_LABEL_KEYWORDS = ("cash - operating", "cash - development", "restricted cash", "escrow", "reserve")
 
 # Balance-sheet accounts the Reconciliation section cross-checks against
@@ -90,10 +94,38 @@ _CASH_LABEL_KEYWORDS = ("cash - operating", "cash - development", "restricted ca
 # different property's chart of accounts numbers things differently.
 _AP_LABEL_KEYWORDS = ("accounts payable",)
 _AR_LABEL_KEYWORDS = ("accounts receivable - control", "accounts receivable - tenant billback")
+# "Contributions"/"Distributions" must be checked as a PREFIX, not a substring
+# match — confirmed 2026-08-19 against real revlabvn/bh1050jv files, which also
+# carry a memo/tracking pair ("125100 Investment Contributions", "125200
+# Investment Distributions", both asset-side accounts) whose labels contain the
+# same words but don't start with them. A substring match summed those in too,
+# silently inflating revlabvn's contributions by the entire $61.2M Investment
+# Contributions balance. The real equity accounts always start with
+# "Contributions -"/"Distributions -" (per-partner sub-accounts); the memo
+# accounts never do.
 _CONTRIBUTIONS_LABEL_KEYWORDS = ("contributions",)
 _DISTRIBUTIONS_LABEL_KEYWORDS = ("distributions",)
 _RETAINED_EARNINGS_LABEL_KEYWORDS = ("retained earnings",)
 _MORTGAGE_LABEL_KEYWORDS = ("mortgage payable",)
+_PREFIX_ONLY_KEYWORDS = (_CONTRIBUTIONS_LABEL_KEYWORDS, _DISTRIBUTIONS_LABEL_KEYWORDS)
+
+
+def _parse_entity_header(col1: str) -> Optional[tuple]:
+    """Returns (block_code, entity_name) if `col1` is an entity-block header
+    row, else None. Handles both real formats: "Property = <code> <name>"
+    and "<Entity Name> (<code>)". Checked in that order — a value that
+    matches neither isn't a header row at all (most rows in the sheet, e.g.
+    every real GL line, whose column 1 is a numeric account code)."""
+    stripped = col1.strip()
+    if stripped.lower().startswith("property"):
+        match = _ENTITY_HEADER_RE.search(stripped)
+        block_code = match.group(1) if match else stripped
+        entity_name = stripped.split("=", 1)[1].strip() if "=" in stripped else stripped
+        return block_code, entity_name
+    match = _ENTITY_NAME_CODE_RE.match(stripped)
+    if match:
+        return match.group("code").strip(), match.group("name").strip()
+    return None
 
 
 def _parse_tb_as_of(ws) -> Optional[object]:
@@ -114,7 +146,11 @@ def _parse_tb_as_of(ws) -> Optional[object]:
 
 
 def _accumulate(current: Optional[float], label_lower: str, keywords: tuple, amount: float, positive: bool) -> Optional[float]:
-    if not any(kw in label_lower for kw in keywords):
+    if keywords in _PREFIX_ONLY_KEYWORDS:
+        matched = any(label_lower.startswith(kw) for kw in keywords)
+    else:
+        matched = any(kw in label_lower for kw in keywords)
+    if not matched:
         return current
     signed = abs(amount) if positive else amount
     return (current or 0.0) + signed
@@ -145,10 +181,9 @@ def parse_entity_trial_balance(
 
     for r in range(1, ws.max_row + 1):
         col1 = ws.cell(row=r, column=1).value
-        if isinstance(col1, str) and col1.strip().lower().startswith("property"):
-            entity_match = _ENTITY_HEADER_RE.search(col1)
-            block_code = entity_match.group(1) if entity_match else col1.strip()
-            entity_name = col1.split("=", 1)[1].strip() if "=" in col1 else col1.strip()
+        header = _parse_entity_header(col1) if isinstance(col1, str) else None
+        if header:
+            block_code, entity_name = header
             in_target_block = not yardi_codes or any(code in block_code for code in yardi_codes)
             current = EntityTrialBalance(entity_code=block_code, entity_name=entity_name, as_of=as_of) if in_target_block else None
             if current:
