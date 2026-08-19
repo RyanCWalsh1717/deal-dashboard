@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 import yaml
@@ -118,6 +119,54 @@ def _normalize_tranche(name: str) -> str:
     (duplicated rather than imported — that one is private to the view
     module): strips spaces + trailing digits so "Note A" matches "Note A1"."""
     return re.sub(r"\d+$", "", name.lower().replace(" ", ""))
+
+
+def _is_rent_charge(c) -> bool:
+    """Same rule as RentRollLine.current_annual_cam: a charge is the base-rent
+    line if charge_type is literally "RENT", or its real description (when
+    present) mentions "rent" — everything else is CAM/recovery/misc."""
+    if c.charge_type.strip().upper() == "RENT":
+        return True
+    return "rent" in c.description.lower()
+
+
+def _real_recovery_and_misc(line) -> Tuple[float, float]:
+    """Splits a suite's real non-rent charges into (recovery, misc/other).
+    Newer Tenancy Schedule exports label each charge's real purpose in
+    `description` (e.g. "Recovery - Real Estate Tax") — those are split by
+    whether "recovery" appears there. Older exports have no description at
+    all on any charge, so there's no way to tell recovery apart from a
+    genuine misc charge (parking, storage, ...); rather than guess, every
+    non-rent dollar on those older files is kept as Recovery (matching this
+    app's long-standing current_annual_cam behavior) and Misc is 0."""
+    non_rent = [c for c in line.charges if not _is_rent_charge(c)]
+    if not non_rent:
+        return 0.0, 0.0
+    has_descriptions = any(c.description for c in non_rent)
+    if not has_descriptions:
+        return sum(c.annual_amount for c in non_rent), 0.0
+    recovery = sum(c.annual_amount for c in non_rent if "recovery" in c.description.lower())
+    misc = sum(c.annual_amount for c in non_rent if c.description and "recovery" not in c.description.lower())
+    return recovery, misc
+
+
+def _contract_rent_for_year(line, year_num: int, as_of) -> Tuple[float, Optional[object]]:
+    """Real contracted rent for projection year `year_num`, if the suite
+    hasn't rolled over by then — starts at today's real annual_rent, then
+    steps up at each contracted rent-step (already agreed in the real lease)
+    whose effective date falls on/before that year's approximate midpoint.
+    Returns (rent, step) so the caller can cite which real step applied, if
+    any — a plain None step means the current rent is still in effect."""
+    if not as_of:
+        return line.annual_rent or 0.0, None
+    year_date = as_of + timedelta(days=365.25 * year_num)
+    applicable = line.annual_rent or 0.0
+    applicable_step = None
+    for step in sorted(line.rent_steps, key=lambda s: s.effective_date):
+        if step.effective_date <= year_date:
+            applicable = step.annual_rent
+            applicable_step = step
+    return applicable, applicable_step
 
 
 def _assumptions_path(cfg: PropertyConfig, data_dir: str = "data") -> Path:
@@ -265,6 +314,11 @@ def build_workbook(
 
     def define(name, sheet, col, row):
         names[name] = f"'{sheet}'!${_col(col)}${row}"
+
+    # Created first so it's the tab that opens by default, but populated last
+    # (below, after Assumptions/Returns exist) — defined-name formula strings
+    # resolve at Excel-open time regardless of build order, so this is safe.
+    ws_dash = out.create_sheet("Dashboard", 0)
 
     # =======================================================================
     # Sheet 1: Assumptions
@@ -436,7 +490,13 @@ def build_workbook(
     if not loan_statements:
         wsA.cell(row=r, column=1, value="(no loan statements loaded)").font = NOTE_FONT
         r += 1
-    r += 1
+    wsA.cell(row=r, column=1, value="Total Existing Debt").font = BOLD_FONT
+    if tranche_rows:
+        _formula_cell(wsA, r, 2, "=" + "+".join(f"B{rr[0]}" for rr in tranche_rows), MONEY_FMT, bold=True)
+    else:
+        _formula_cell(wsA, r, 2, "=0", MONEY_FMT, bold=True)
+    define("ExistingDebtBalance", "Assumptions", 2, r)
+    r += 2
 
     wsA.cell(row=r, column=1, value="Current SOFR (shared, real, derived from loan statements)")
     if implied_sofr_rows:
@@ -548,7 +608,7 @@ def build_workbook(
     # =======================================================================
     ws1 = out.create_sheet("Rent Roll (Current)")
     ws1.sheet_view.showGridLines = False
-    _autosize(ws1, [10, 12, 10, 12, 12, 30, 16, 12, 14, 12])
+    _autosize(ws1, [10, 12, 10, 12, 12, 30, 16, 12, 14, 12, 16, 16])
 
     ws1["A1"] = f"{cfg.display()} — Current Rent Roll"
     ws1["A1"].font = TITLE_FONT
@@ -557,7 +617,10 @@ def build_workbook(
 
     r = 4
     header_row = r
-    headers = ["Building", "Floor", "Unit", "SF", "Status", "Tenant", "Annual Rent", "Rent PSF", "Lease Expiration", "Rollover Year"]
+    headers = [
+        "Building", "Floor", "Unit", "SF", "Status", "Tenant", "Annual Rent", "Rent PSF",
+        "Lease Expiration", "Rollover Year", "Current Annual Recovery ($)", "Current Annual Misc/Other ($)",
+    ]
     for i, h in enumerate(headers, start=1):
         ws1.cell(row=header_row, column=i, value=h)
     _style_header_row(ws1, header_row, len(headers))
@@ -566,6 +629,7 @@ def build_workbook(
     for idx, line in enumerate(rent_roll.lines):
         rm = rollover_month(line)
         ry = _year_of_month(rm)
+        recovery, misc = _real_recovery_and_misc(line)
         ws1.cell(row=r, column=1, value=line.building).border = BORDER
         ws1.cell(row=r, column=2, value=str(line.floor)).border = BORDER
         ws1.cell(row=r, column=3, value=line.unit_code).border = BORDER
@@ -581,11 +645,83 @@ def build_workbook(
             "Vacant suites = Month 1. Simplification: models each suite's FIRST rollover only.",
             "Deal Dashboard",
         )
-        for c in range(1, 11):
+        c11 = ws1.cell(row=r, column=11, value=recovery); c11.number_format = MONEY_FMT; c11.border = BORDER
+        c11.comment = Comment(
+            "Real, from the Tenancy Schedule's per-charge breakdown — charges whose description "
+            "mentions \"recovery\", or (older exports with no per-charge description) every "
+            "non-rent charge on the lease.", "Deal Dashboard")
+        c12 = ws1.cell(row=r, column=12, value=misc); c12.number_format = MONEY_FMT; c12.border = BORDER
+        c12.comment = Comment(
+            "Real, non-rent charges that aren't a labeled recovery (e.g. parking, storage) — only "
+            "ever non-zero on newer exports that carry a per-charge description.", "Deal Dashboard")
+        for c in range(1, 13):
             ws1.cell(row=r, column=c).font = FORMULA_FONT
         rent_roll_rows[idx] = (r, line, ry, rm)
         r += 1
     ws1.freeze_panes = "A5"
+
+    total_rentable_sf = sum((line.unit_area or 0.0) for _, line, _, _ in rent_roll_rows.values())
+
+    # =======================================================================
+    # Sheet: Revenue & OpEx by Floor (current/Year-0 snapshot only)
+    # =======================================================================
+    ws_floor = out.create_sheet("Revenue & OpEx by Floor")
+    ws_floor.sheet_view.showGridLines = False
+    _autosize(ws_floor, [16, 12, 16, 16, 16, 16, 16])
+
+    ws_floor["A1"] = "Revenue & OpEx by Floor (Current)"
+    ws_floor["A1"].font = TITLE_FONT
+    ws_floor["A2"] = (
+        "Current (Year 0) snapshot only, grouped by the real floor each suite sits on. Revenue is "
+        "real, per suite, from the Rent Roll sheet. OpEx is a real BUILDING-LEVEL total allocated "
+        "to each floor by its SF share — the app has no real per-floor OpEx source, so this is an "
+        "allocation, not an actual, and is labeled as such."
+    )
+    ws_floor["A2"].font = NOTE_FONT
+    ws_floor.merge_cells("A2:G2")
+    ws_floor.row_dimensions[2].height = 40
+
+    floors: Dict[str, List[int]] = {}
+    for idx, (rr_row, line, ry, rm) in rent_roll_rows.items():
+        floors.setdefault(line.floor or "(none)", []).append(rr_row)
+
+    opex_baseline_first = min(opex_category_rows.values())
+    opex_baseline_last = max(opex_category_rows.values())
+    total_opex_baseline_ref = f"SUM(Assumptions!B{opex_baseline_first}:B{opex_baseline_last})"
+
+    r = 4
+    header_row = r
+    headers = ["Floor", "SF", "Annual Rent (real)", "Recovery (real)", "Misc/Other (real)", "Total Real Income", "Allocated OpEx (SF share)"]
+    for i, h in enumerate(headers, start=1):
+        ws_floor.cell(row=header_row, column=i, value=h)
+    _style_header_row(ws_floor, header_row, len(headers))
+    r += 1
+
+    floor_total_row_start = r
+    for floor, rows_for_floor in sorted(floors.items()):
+        ws_floor.cell(row=r, column=1, value=floor).border = BORDER
+        sf_refs = "+".join(f"'Rent Roll (Current)'!D{rr}" for rr in rows_for_floor)
+        rent_refs = "+".join(f"'Rent Roll (Current)'!G{rr}" for rr in rows_for_floor)
+        recovery_refs = "+".join(f"'Rent Roll (Current)'!K{rr}" for rr in rows_for_floor)
+        misc_refs = "+".join(f"'Rent Roll (Current)'!L{rr}" for rr in rows_for_floor)
+        _formula_cell(ws_floor, r, 2, f"={sf_refs}", SF_FMT)
+        _formula_cell(ws_floor, r, 3, f"={rent_refs}", MONEY_FMT)
+        _formula_cell(ws_floor, r, 4, f"={recovery_refs}", MONEY_FMT)
+        _formula_cell(ws_floor, r, 5, f"={misc_refs}", MONEY_FMT)
+        _formula_cell(ws_floor, r, 6, f"=C{r}+D{r}+E{r}", MONEY_FMT, bold=True)
+        opex_cell = _formula_cell(ws_floor, r, 7, f"=(B{r}/{total_rentable_sf})*{total_opex_baseline_ref}", MONEY_FMT)
+        opex_cell.comment = Comment(
+            "Allocation, not a real per-floor actual — this floor's SF share of the real "
+            "building-wide Recoverable OpEx baseline (Assumptions sheet).", "Deal Dashboard")
+        r += 1
+    floor_total_row_end = r - 1
+
+    ws_floor.cell(row=r, column=1, value="Total").font = BOLD_FONT
+    for col in range(2, 8):
+        cl = _col(col)
+        _formula_cell(ws_floor, r, col, f"=SUM({cl}{floor_total_row_start}:{cl}{floor_total_row_end})", SF_FMT if col == 2 else MONEY_FMT, bold=True)
+
+    ws_floor.freeze_panes = "A5"
 
     # =======================================================================
     # Sheet 3: Rollover & Rent Projection (annual, unchanged mechanics)
@@ -597,10 +733,11 @@ def build_workbook(
     ws3["A1"] = "Rollover & Rent Projection"
     ws3["A1"].font = TITLE_FONT
     ws3["A2"] = (
-        "Pre-rollover years hold each suite's real current rent flat. At rollover, rent resets to "
-        "the escalated market rate below; downtime/free rent reduce cash collected only in the "
-        "rollover year itself. The Monthly Cash Flow sheet levels each year's total evenly across "
-        "its 12 months, except TI/LC which fires in the exact rollover month."
+        "Pre-rollover years follow each suite's real contracted rent-step schedule (already agreed "
+        "in the lease). At rollover, rent resets to the escalated market rate below; downtime/free "
+        "rent reduce cash collected only in the rollover year itself. The Monthly Cash Flow sheet "
+        "levels each year's total evenly across its 12 months, except TI/LC which fires in the "
+        "exact rollover month."
     )
     ws3["A2"].font = NOTE_FONT
     ws3.merge_cells("A2:F2")
@@ -626,12 +763,18 @@ def build_workbook(
         label = f"{line.building}-{line.floor}-{line.unit_code}" + (" (vacant)" if line.is_vacant else f" — {line.tenant_name}")
         ws3.cell(row=r, column=1, value=f"Contract Rent: {label}")
         sf_ref = f"'Rent Roll (Current)'!D{rr_row}"
-        cur_rent_ref = f"'Rent Roll (Current)'!G{rr_row}"
         for col in YEAR_COLS:
             year_num = col - YEAR_COLS[0] + 1
             cl = _col(col)
-            formula = f"={cur_rent_ref}" if year_num < ry else f"={sf_ref}*{cl}${market_rent_row}"
-            _formula_cell(ws3, r, col, formula, MONEY_FMT)
+            if year_num < ry:
+                rent_value, step = _contract_rent_for_year(line, year_num, as_of)
+                comment = (
+                    f"Real contracted rent step effective {step.effective_date.strftime('%m/%d/%Y')}."
+                    if step else "Real current contract rent — no rent step due yet."
+                )
+                _real_cell(ws3, r, col, rent_value, MONEY_FMT, comment)
+            else:
+                _formula_cell(ws3, r, col, f"={sf_ref}*{cl}${market_rent_row}", MONEY_FMT)
         contract_rows[idx] = r
         r += 1
     r += 1
@@ -675,6 +818,64 @@ def build_workbook(
         _formula_cell(ws3, r, col, f"={cl}{total_cash_row}/{cl}{total_contract_row}", PCT_FMT)
     r += 2
 
+    ws3.cell(row=r, column=1, value="Per-Suite Real Recovery Income ($/Yr)").font = SECTION_FONT
+    ws3.cell(row=r, column=1).comment = Comment(
+        "Real, from the Tenancy Schedule's own per-charge breakdown (see the Rent Roll sheet), "
+        "escalated by Opex Growth like the pass-through it is — only while the suite is still on "
+        "its current lease. Once a suite rolls over, its recovery income switches to the blended "
+        "Recovery % assumption (applied at the building level on the Monthly Cash Flow sheet, "
+        "since a new lease's recovery structure isn't known yet).", "Deal Dashboard")
+    r += 1
+    real_recovery_row_start = r
+    real_recovery_rows_by_suite: Dict[int, int] = {}
+    for idx, (rr_row, line, ry, rm) in rent_roll_rows.items():
+        label = f"{line.building}-{line.floor}-{line.unit_code}"
+        ws3.cell(row=r, column=1, value=f"Recovery: {label}")
+        recovery_ref = f"'Rent Roll (Current)'!K{rr_row}"
+        for col in YEAR_COLS:
+            year_num = col - YEAR_COLS[0] + 1
+            if year_num < ry:
+                escal = f"*(1+OpexGrowth)^{year_num - 1}" if year_num > 1 else ""
+                formula = f"={recovery_ref}{escal}"
+            else:
+                formula = "=0"
+            _formula_cell(ws3, r, col, formula, MONEY_FMT)
+        real_recovery_rows_by_suite[idx] = r
+        r += 1
+    real_recovery_row_end = r - 1
+    ws3.cell(row=r, column=1, value="Total Real Recovery Income").font = BOLD_FONT
+    total_real_recovery_row = r
+    for col in YEAR_COLS:
+        cl = _col(col)
+        _formula_cell(ws3, r, col, f"=SUM({cl}{real_recovery_row_start}:{cl}{real_recovery_row_end})", MONEY_FMT, bold=True)
+    r += 2
+
+    ws3.cell(row=r, column=1, value="Per-Suite Real Misc / Other Income ($/Yr)").font = SECTION_FONT
+    ws3.cell(row=r, column=1).comment = Comment(
+        "Real, non-rent charges that aren't a labeled recovery (e.g. parking, storage) — held flat "
+        "(no real escalator known for these) while the suite is on its current lease, then $0 once "
+        "it rolls over. Unlike Recovery, there's no blended assumption standing in for this after "
+        "rollover — a new lease's misc charges aren't modeled at all, same treatment as any other "
+        "unknown about a not-yet-signed lease.", "Deal Dashboard")
+    r += 1
+    real_misc_row_start = r
+    for idx, (rr_row, line, ry, rm) in rent_roll_rows.items():
+        label = f"{line.building}-{line.floor}-{line.unit_code}"
+        ws3.cell(row=r, column=1, value=f"Misc/Other: {label}")
+        misc_ref = f"'Rent Roll (Current)'!L{rr_row}"
+        for col in YEAR_COLS:
+            year_num = col - YEAR_COLS[0] + 1
+            formula = f"={misc_ref}" if year_num < ry else "=0"
+            _formula_cell(ws3, r, col, formula, MONEY_FMT)
+        r += 1
+    real_misc_row_end = r - 1
+    ws3.cell(row=r, column=1, value="Total Real Misc / Other Income").font = BOLD_FONT
+    total_real_misc_row = r
+    for col in YEAR_COLS:
+        cl = _col(col)
+        _formula_cell(ws3, r, col, f"=SUM({cl}{real_misc_row_start}:{cl}{real_misc_row_end})", MONEY_FMT, bold=True)
+    r += 2
+
     ws3.cell(row=r, column=1, value="TI / LC Cost This Year ($)").font = SECTION_FONT
     ws3.cell(row=r, column=1).comment = Comment(
         "Fires only in each suite's own rollover year: SF x (Blended TI + Blended LC), both "
@@ -705,6 +906,16 @@ def build_workbook(
         _formula_cell(ws3, r, col, f"=SUM({cl}{ti_lc_row_start}:{cl}{ti_lc_row_end})", MONEY_FMT, bold=True)
 
     ws3.freeze_panes = "B5"
+
+    def rolled_over_sf_fraction(year_num: int) -> float:
+        """SF-weighted share of the building that's already rolled over by
+        `year_num`, used to blend the assumption-driven Recovery % onto only
+        the SF that no longer has a real recovery figure — real recovery
+        (above) already covers the rest."""
+        if not total_rentable_sf:
+            return 0.0
+        rolled_sf = sum((line.unit_area or 0.0) for _, line, ry, _ in rent_roll_rows.values() if year_num >= ry)
+        return rolled_sf / total_rentable_sf
 
     # =======================================================================
     # Sheet 4: Monthly Cash Flow (new)
@@ -785,13 +996,19 @@ def build_workbook(
     recovery_m_row = month_row(
         "Recovery Income",
         lambda m, col: (
-            f"=RecoveryPct*-{_col(col)}{total_opex_m_row}*"
+            f"='Rollover & Rent Projection'!{_col(year_col_for_month(m))}{total_real_recovery_row}/12"
+            f"+RecoveryPct*-{_col(col)}{total_opex_m_row}*"
             f"'Rollover & Rent Projection'!{_col(year_col_for_month(m))}{collection_factor_row}"
+            f"*{rolled_over_sf_fraction(_year_of_month(m))}"
         ),
+    )
+    misc_m_row = month_row(
+        "Misc / Other Income (real, pre-rollover only)",
+        lambda m, col: f"='Rollover & Rent Projection'!{_col(year_col_for_month(m))}{total_real_misc_row}/12",
     )
     total_rev_m_row = month_row(
         "Total Revenue",
-        lambda m, col: f"={_col(col)}{egi_m_row}+{_col(col)}{recovery_m_row}", bold=True,
+        lambda m, col: f"={_col(col)}{egi_m_row}+{_col(col)}{recovery_m_row}+{_col(col)}{misc_m_row}", bold=True,
     )
     noi_m_row = month_row(
         "NOI",
@@ -1000,8 +1217,9 @@ def build_workbook(
         "Non-operating Expenses", nonop_m_row, year0_formula=f"=-{nonop_actual or 0}/{months_ytd}*12"
     )
     recovery_row = annual_flow_row("Recovery Income", recovery_m_row, year0_formula=f"=RecoveryPct*-B{opex_row}")
+    misc_row = annual_flow_row("Misc / Other Income", misc_m_row)
     total_rev_row = annual_flow_row(
-        "Total Revenue", total_rev_m_row, bold=True, year0_formula=f"=B{egi_row}+B{recovery_row}"
+        "Total Revenue", total_rev_m_row, bold=True, year0_formula=f"=B{egi_row}+B{recovery_row}+B{misc_row}"
     )
     noi_row = annual_flow_row(
         "NOI", noi_m_row, bold=True, year0_formula=f"=B{total_rev_row}+B{opex_row}+B{nonop_row}"
@@ -1108,17 +1326,119 @@ def build_workbook(
     cf_to_equity_row = r
     r += 2
 
+    last_yc = _col(YEAR_COLS[-1])
+
     ws5.cell(row=r, column=1, value="IRR")
-    _formula_cell(ws5, r, 2, f"=IRR(B{cf_to_equity_row}:{_col(YEAR_COLS[-1])}{cf_to_equity_row})", PCT_FMT, bold=True)
+    _formula_cell(ws5, r, 2, f"=IRR(B{cf_to_equity_row}:{last_yc}{cf_to_equity_row})", PCT_FMT, bold=True)
+    define("ProjectIRR", "Returns", 2, r)
     r += 1
     ws5.cell(row=r, column=1, value="Equity Multiple")
     _formula_cell(
         ws5, r, 2,
-        f'=SUMIF(C{cf_to_equity_row}:{_col(YEAR_COLS[-1])}{cf_to_equity_row},">0")/-B{cf_to_equity_row}',
+        f'=SUMIF(C{cf_to_equity_row}:{last_yc}{cf_to_equity_row},">0")/-B{cf_to_equity_row}',
         MULT_FMT, bold=True,
     )
+    define("EquityMultiple", "Returns", 2, r)
+    r += 2
+
+    ws5.cell(row=r, column=1, value="Exit Year NOI (at Hold Period)").font = BOLD_FONT
+    _formula_cell(
+        ws5, r, 2,
+        f"=SUMPRODUCT(C{exit_flag_row}:{last_yc}{exit_flag_row},C{exit_noi_row}:{last_yc}{exit_noi_row})",
+        MONEY_FMT, bold=True,
+    )
+    define("ExitYearNOI", "Returns", 2, r)
+    r += 1
+    ws5.cell(row=r, column=1, value="Net Sale Proceeds at Exit").font = BOLD_FONT
+    _formula_cell(
+        ws5, r, 2,
+        f"=SUMPRODUCT(C{exit_flag_row}:{last_yc}{exit_flag_row},C{net_sale_row}:{last_yc}{net_sale_row})",
+        MONEY_FMT, bold=True,
+    )
+    define("NetSaleProceedsAtExit", "Returns", 2, r)
 
     ws5.freeze_panes = "B5"
+
+    # =======================================================================
+    # Sheet 0: Dashboard (populated last so every reference below already
+    # exists as a defined name or a known cell — see the note where it's
+    # created, at the top of this function, for why that's safe)
+    # =======================================================================
+    ws_dash.sheet_view.showGridLines = False
+    _autosize(ws_dash, [34, 20, 20, 20])
+
+    ws_dash["A1"] = f"{cfg.display()} — Hold/Sell Dashboard"
+    ws_dash["A1"].font = TITLE_FONT
+    ws_dash["A2"] = (
+        "At-a-glance summary — every figure here is pulled from the Assumptions/Rollover/Monthly/"
+        "Returns sheets, nothing new is computed on this tab. \"Sources\" below is the property's "
+        "current capital stack (real debt + real net invested equity), not an acquisition-style "
+        "Sources & Uses — this is a hold/sell model for an asset GRP already owns, not a purchase."
+    )
+    ws_dash["A2"].font = NOTE_FONT
+    ws_dash.merge_cells("A2:D2")
+    ws_dash.row_dimensions[2].height = 40
+
+    # Uses raw unit_area (one physical SF total, no double-counting) rather than
+    # rent_roll.total_leased_sf, which prefers lease_area — deliberately inflated for
+    # a multi-unit tenant (counts its full combined space), a tenant-perspective
+    # measure that's right for the app's own Rent Roll section but wrong for a
+    # building-wide physical total. Same total_rentable_sf already used for the
+    # SF-share split driving post-rollover Recovery Income above.
+    total_vacant_sf = sum((line.unit_area or 0.0) for _, line, _, _ in rent_roll_rows.values() if line.is_vacant)
+    total_leased_sf = total_rentable_sf - total_vacant_sf
+    occupancy = (total_leased_sf / total_rentable_sf) if total_rentable_sf else None
+
+    r = 4
+    r = _section_header(ws_dash, r, "Property Snapshot (Real)", span=2)
+    for label, value, fmt, comment in [
+        ("As of", as_of.strftime("%B %d, %Y") if as_of else "n/a", None, None),
+        ("Total Rentable SF", total_rentable_sf, SF_FMT, None),
+        ("Leased SF", total_leased_sf, SF_FMT, "Physical SF, not the app's own tenant-perspective \"Leased SF\" figure — may differ slightly for multi-unit tenants."),
+        ("Vacant SF", total_vacant_sf, SF_FMT, None),
+        ("Occupancy", occupancy, PCT_FMT, None),
+    ]:
+        ws_dash.cell(row=r, column=1, value=label).border = BORDER
+        _real_cell(ws_dash, r, 2, value, fmt, comment)
+        r += 1
+    r += 1
+
+    r = _section_header(ws_dash, r, "Current Capital Stack (\"Sources\")", span=2)
+    for label, formula in [
+        ("Total Existing Debt (real)", "=ExistingDebtBalance"),
+        ("Starting Net Invested Equity (real)", "=StartingEquity"),
+        ("Total Capitalization", "=ExistingDebtBalance+StartingEquity"),
+    ]:
+        ws_dash.cell(row=r, column=1, value=label).border = BORDER
+        _formula_cell(ws_dash, r, 2, formula, MONEY_FMT, bold=(label == "Total Capitalization"))
+        r += 1
+    r += 1
+
+    r = _section_header(ws_dash, r, "Hold Period & Key Assumptions", span=2)
+    for label, formula, fmt in [
+        ("Hold Period (years)", "=HoldPeriod", "0"),
+        ("Exit Cap Rate", "=CapRate", PCT_FMT),
+        ("Rent Growth (annual)", "=RentGrowth", PCT_FMT),
+        ("Opex Growth (annual)", "=OpexGrowth", PCT_FMT),
+        ("Refinance Year", "=RefiYear", "0"),
+    ]:
+        ws_dash.cell(row=r, column=1, value=label).border = BORDER
+        _formula_cell(ws_dash, r, 2, formula, fmt)
+        r += 1
+    r += 1
+
+    r = _section_header(ws_dash, r, "Returns", span=2)
+    for label, formula, fmt, bold in [
+        ("Exit Year NOI (at Hold Period)", "=ExitYearNOI", MONEY_FMT, False),
+        ("Net Sale Proceeds at Exit", "=NetSaleProceedsAtExit", MONEY_FMT, False),
+        ("IRR", "=ProjectIRR", PCT_FMT, True),
+        ("Equity Multiple", "=EquityMultiple", MULT_FMT, True),
+    ]:
+        ws_dash.cell(row=r, column=1, value=label).font = BOLD_FONT if bold else Font(name=FONT_NAME)
+        _formula_cell(ws_dash, r, 2, formula, fmt, bold=bold)
+        r += 1
+
+    ws_dash.freeze_panes = "A4"
 
     for name, ref in names.items():
         out.defined_names[name] = DefinedName(name, attr_text=ref)
