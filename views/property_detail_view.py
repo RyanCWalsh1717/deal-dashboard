@@ -6,6 +6,7 @@ Leasing & Investment Outlook (placeholder).
 
 from __future__ import annotations
 
+import io
 import re
 from typing import List, Optional
 
@@ -20,6 +21,7 @@ from pipeline.models import (
     RentRollResult,
     WaterfallTier,
 )
+from pipeline import holdsell_model
 from pipeline.parsers.abstract_loader import load_jv_abstract, load_loan_abstract
 from pipeline.property_config import PropertyConfig
 from views.branding import render_hero, render_kpi_tiles
@@ -125,6 +127,7 @@ SECTIONS = [
     "Distribution Waterfall",
     "Budget vs. Actuals",
     "Annual Budget",
+    "Hold/Sell Assumptions",
     "Sources & Uses",
     "Leasing & Investment Outlook",
 ]
@@ -150,6 +153,7 @@ def render_property_detail(
     rent_roll: Optional[RentRollResult] = None,
     loan_statements: Optional[List[LoanStatement]] = None,
     entity_trial_balances: Optional[List[EntityTrialBalance]] = None,
+    data_dir: str = "data",
 ) -> None:
     cash_accounts = cash_accounts or []
     loan_statements = loan_statements or []
@@ -195,6 +199,8 @@ def render_property_detail(
         _render_budget(result)
     elif section == "Annual Budget":
         _render_annual_budget(result)
+    elif section == "Hold/Sell Assumptions":
+        _render_holdsell_assumptions(cfg, result, rent_roll, loan_statements, entity_trial_balances, data_dir)
     elif section == "Sources & Uses":
         st.info(
             "Sources & Uses will populate once the leasing/investment outlook model is finalized — "
@@ -984,3 +990,72 @@ def _render_annual_budget(result: Optional[DistributionWorkbookResult]) -> None:
         "report uses (Income → OpEx → NOI → Debt Service → CapEx). Net Income is left out: it's a "
         "trailing-12-month actual-only figure, a different concept from a January-through-YTD sum."
     )
+
+
+def _render_holdsell_assumptions(
+    cfg: PropertyConfig,
+    result: Optional[DistributionWorkbookResult],
+    rent_roll: Optional[RentRollResult],
+    loan_statements: List[LoanStatement],
+    entity_trial_balances: List[EntityTrialBalance],
+    data_dir: str,
+) -> None:
+    st.caption(
+        "Assumptions here drive the Hold/Sell Excel model — edit and save them below, then "
+        "download a fresh copy of the workbook with these values and the latest real data baked "
+        "in. All the actual math (rollover schedule, debt amortization, IRR) lives only in the "
+        "workbook's own formulas, never duplicated here, so there's exactly one place it can be "
+        "wrong instead of two that could disagree."
+    )
+
+    current = holdsell_model.load_assumptions(cfg, data_dir)
+
+    sections: List[str] = []
+    for _, _, section, _ in holdsell_model.ASSUMPTION_FIELDS:
+        if section not in sections:
+            sections.append(section)
+
+    with st.form("holdsell_assumptions_form"):
+        new_values: dict = {}
+        for section in sections:
+            st.markdown(f"**{section}**")
+            for key, label, field_section, kind in holdsell_model.ASSUMPTION_FIELDS:
+                if field_section != section:
+                    continue
+                stored = current.get(key)
+                if kind == "pct":
+                    shown = stored * 100 if stored is not None else None
+                    val = st.number_input(f"{label}", value=shown, step=0.1, format="%.2f", key=f"hs_{key}")
+                    new_values[key] = (val / 100) if val is not None else None
+                elif kind in ("years", "months"):
+                    val = st.number_input(f"{label}", value=stored, step=1.0, format="%.0f", key=f"hs_{key}")
+                    new_values[key] = val
+                elif kind == "dollar_psf":
+                    val = st.number_input(f"{label}", value=stored, step=0.5, format="%.2f", key=f"hs_{key}")
+                    new_values[key] = val
+                else:  # dollar
+                    val = st.number_input(f"{label}", value=stored, step=1000.0, format="%.0f", key=f"hs_{key}")
+                    new_values[key] = val
+        saved = st.form_submit_button("Save Assumptions")
+        if saved:
+            holdsell_model.save_assumptions(cfg, new_values, data_dir)
+            st.success("Assumptions saved.")
+            current = new_values
+
+    st.divider()
+    if not result or not rent_roll:
+        st.info("Download isn't available yet — the Hold/Sell model needs a distribution workbook and rent roll loaded for this period.")
+        return
+
+    try:
+        wb = holdsell_model.build_workbook(cfg, result, rent_roll, loan_statements, entity_trial_balances, current)
+        buf = io.BytesIO()
+        wb.save(buf)
+        st.download_button(
+            "Download Excel Model",
+            data=buf.getvalue(),
+            file_name=f"{cfg.display()} - Hold-Sell Model.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        st.error(f"Couldn't build the export: {exc}")

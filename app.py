@@ -233,7 +233,7 @@ def main() -> None:
     periods = source_files.list_periods(cfg, str(DATA_DIR))
     selected_period = None
     if periods:
-        if period_key not in st.session_state:
+        if period_key not in st.session_state or st.session_state[period_key] not in periods:
             st.session_state[period_key] = periods[0]
         selected_period = st.sidebar.selectbox("Viewing Period", periods, key=period_key)
 
@@ -263,6 +263,51 @@ def main() -> None:
                 st.session_state.pending_period = newest_period
             st.session_state.upload_epoch[selected_code] = epoch + 1
             st.rerun()
+
+    with st.sidebar.expander("Reset Source Files"):
+        st.caption(
+            "Remove a file that was uploaded by mistake, or clear an entire period. "
+            "Deleting can't be undone from here, so each action needs the exact "
+            "file or period name typed in before it activates."
+        )
+        if not periods:
+            st.caption("No periods yet.")
+        else:
+            reset_period_key = f"reset_period_select_{selected_code}"
+            if reset_period_key not in st.session_state or st.session_state[reset_period_key] not in periods:
+                st.session_state[reset_period_key] = selected_period or periods[0]
+            reset_period = st.selectbox("Period", periods, key=reset_period_key)
+
+            reset_files = source_files.list_period_contents(cfg, reset_period, str(DATA_DIR))
+            if not reset_files:
+                st.caption(f"No files for {reset_period}.")
+            else:
+                for f in reset_files:
+                    col_label, col_confirm, col_button = st.columns([3, 2, 1])
+                    col_label.markdown(f"**{source_files.describe_period_file(f)}**\n\n{f.name}")
+                    confirm_key = f"reset_confirm_{selected_code}_{reset_period}_{f.name}"
+                    typed = col_confirm.text_input(
+                        "Confirm", key=confirm_key, placeholder=f.name, label_visibility="collapsed"
+                    )
+                    if col_button.button("Remove", key=f"reset_btn_{confirm_key}", disabled=(typed != f.name)):
+                        source_files.delete_period_file(f)
+                        st.rerun()
+
+                st.divider()
+                st.caption(f"Clear every file for {reset_period}:")
+                col_confirm, col_button = st.columns([3, 1])
+                clear_key = f"clear_period_confirm_{selected_code}_{reset_period}"
+                typed_period = col_confirm.text_input(
+                    "Confirm period",
+                    key=clear_key,
+                    placeholder=f"Type {reset_period} to confirm",
+                    label_visibility="collapsed",
+                )
+                if col_button.button(
+                    "Delete this period", key=f"clear_period_btn_{clear_key}", disabled=(typed_period != reset_period)
+                ):
+                    source_files.delete_period(cfg, reset_period, str(DATA_DIR))
+                    st.rerun()
 
     if not periods:
         st.info(
@@ -336,7 +381,7 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Failed to parse rent roll: {exc}")
 
-    render_property_detail(cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances)
+    render_property_detail(cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR))
 
 
 if not check_password():

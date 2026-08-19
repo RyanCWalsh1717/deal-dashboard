@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import io
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import openpyxl
 
@@ -216,4 +217,65 @@ def resolve_period_trial_balances(cfg: PropertyConfig, period: str, data_dir: st
             files = sorted(candidate_dir.glob("trial_balance_*.xlsx"))
             if files:
                 return files
+    return []
+
+
+FILE_TYPE_LABELS: Dict[str, str] = {
+    "distribution_workbook": "Distribution Workbook",
+    "rent_roll": "Rent Roll",
+    "budget_comparison": "Budget Comparison Report",
+}
+
+
+def list_period_contents(cfg: PropertyConfig, period: str, data_dir: str = "data") -> List[Path]:
+    """Every source file literally present in `period`'s own folder — unlike
+    resolve_period_file()/resolve_period_*() (which carry forward from an
+    earlier period when nothing was re-uploaded), this never looks outside
+    the one folder, since "reset" should only ever touch what's actually
+    sitting there."""
+    period_dir = Path(data_dir) / cfg.property_code / "source_files" / period
+    if not period_dir.exists():
+        return []
+
+    files = [
+        period_dir / name for name in _CANONICAL_NAMES.values() if (period_dir / name).exists()
+    ]
+    files += sorted(period_dir.glob("trial_balance_*.xlsx"))
+    files += sorted((period_dir / "loan_statements").glob("*.pdf"))
+    return sorted(files, key=lambda p: p.name)
+
+
+def describe_period_file(path: Path) -> str:
+    """Friendly label for a path returned by list_period_contents() — reads
+    the naming convention already on disk (canonical stem, or the
+    trial_balance_<entity>/loan_statements/<tranche> suffix) rather than
+    re-deriving anything from the file's own content."""
+    stem = path.stem
+    if path.parent.name == "loan_statements":
+        return f"Loan Statement — {stem.replace('_', ' ').title()}"
+    if stem.startswith("trial_balance_"):
+        return f"Trial Balance — {stem[len('trial_balance_'):]}"
+    return FILE_TYPE_LABELS.get(stem, stem)
+
+
+def _prune_empty_dirs(period_dir: Path) -> None:
+    loan_dir = period_dir / "loan_statements"
+    if loan_dir.exists() and not any(loan_dir.iterdir()):
+        loan_dir.rmdir()
+    if period_dir.exists() and not any(period_dir.iterdir()):
+        period_dir.rmdir()
+
+
+def delete_period_file(path: Path) -> None:
+    """Removes one source file, then prunes now-empty loan_statements/ and
+    period directories so they stop showing up in list_periods()."""
+    period_dir = path.parent if path.parent.name != "loan_statements" else path.parent.parent
+    path.unlink()
+    _prune_empty_dirs(period_dir)
+
+
+def delete_period(cfg: PropertyConfig, period: str, data_dir: str = "data") -> None:
+    period_dir = Path(data_dir) / cfg.property_code / "source_files" / period
+    if period_dir.exists():
+        shutil.rmtree(period_dir)
     return []

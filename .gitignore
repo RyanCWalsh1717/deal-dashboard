@@ -6,6 +6,7 @@ Thumbs.db
 # Sensitive financial source files — never commit
 data/*/source_files/
 data/*/abstracts/
+data/*/holdsell_assumptions.yaml
 *.xlsx
 *.xls
 *.pdf
