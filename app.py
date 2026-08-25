@@ -225,6 +225,277 @@ def _process_uploads(cfg: PropertyConfig, uploaded_files) -> Tuple[Optional[str]
     return newest_period, messages
 
 
+_TEMPLATE_SHEET_MAP = {
+    "cash_flow": "Cash Flow",
+    "equity_lp": "Equity - LP",
+    "equity_bhc": "Equity - BHC",
+    "debt": "Loan Interest",
+    "waterfall_property": "Distribution Recommendation",
+    "waterfall_cogp": "Distribution Recommendation BHC",
+    "budget_current": "Budget",
+}
+_ROLE_OPTIONS = ["LP", "GP", "Sponsor", "co-GP", "co-GP member"]
+
+
+def _render_how_to_use() -> None:
+    st.markdown(
+        """
+**Views** (the tabs above)
+- **Portfolio** — every active property, one row each, with headline cash/debt/distribution figures.
+- **Property Detail** — everything for the **Active Property** picked above. Pick a month/quarter from **Viewing Period** next to it.
+- **Properties** — add a new property or edit an existing one's basics. See below.
+
+**Uploading files**
+Drop files into **Update Source Files** (sidebar) — each one is auto-detected by its content (not its filename), so you don't need to sort them first. Drop as many as you want at once. Recognized types: distribution workbook, trial balance (one file per entity — e.g. property, venture, co-GP), rent roll, Yardi Budget Comparison report, and loan servicer statement PDFs. A file is filed under whatever period it's dated as of — if a type isn't re-uploaded in a given month, the app shows the last known version instead of going blank.
+
+If a file gets rejected, the message right above the uploader explains why (usually "couldn't find an as-of date" or "doesn't look like any known file type") — it stays on screen until the next upload.
+
+**Removing a file** — open **Reset Source Files** (sidebar), pick the period, and either remove one file or clear the whole period. Each action needs you to type the exact file/period name first — deletes can't be undone from here.
+
+**Sections** (the pills below the property header, inside Property Detail)
+- **Summary** — the one-glance view: cash, NOI, debt, occupancy, with jump links into the detail sections.
+- **Cash** — every cash/escrow/reserve account, by source.
+- **Equity & Capital** — contributions, distributions, and capital balances per entity.
+- **Balance Sheet** — full balance sheet per entity, from the distribution workbook's equity tabs.
+- **Rent Roll** — occupancy, lease terms, current rent/CAM, and upcoming rent steps per suite.
+- **Debt & Loans** — forecast (distribution workbook) vs. actual (loan statements) balances and rates, side by side.
+- **Distribution Waterfall** — the JV distribution calc per ownership tier.
+- **Budget vs. Actuals** — two toggles: Period-to-Date (the selected month) vs. Year-to-Date, and Summary (P&L rollup, plus a BOMA-category OpEx breakdown) vs. Detailed (account-level). Year-to-Date also shows a Reforecast column (the distribution workbook's own current-year figure) alongside Kardin's once-per-year Annual Budget.
+- **Hold/Sell Assumptions** — see below.
+- **Sources & Uses** / **Leasing & Investment Outlook** — placeholders until the leasing/investment model is finalized.
+- **Reconciliation** — cross-checks each uploaded trial balance's own figures (AR/AP/mortgage/cash) against the other source files that should describe the same real-world numbers; flags anything off by more than a small tolerance (could just be a timing difference between files).
+
+**Hold/Sell Assumptions**
+This section holds the inputs for the property's hold/sell model (inflation, vacancy, market leasing terms, cap rate, hold period, refinance) so anyone can view or change them without opening Excel. **Save Assumptions** persists them for next time. **Download Excel Model** produces a fresh workbook with those assumptions plus the latest real data (rent roll, actuals, debt, equity) already filled in — all the actual math (rollover schedule, debt amortization, IRR) lives in that workbook's own formulas, not in the app, so the exported file is always the authoritative calculation.
+
+**Adding a property**
+Use the **Properties** tab: fill in the basics, Yardi entity codes, and (optionally) a single ownership tier with its investors, then **Save Property**. If GitHub isn't connected (see the banner at the top of that tab), the config only saves to this machine's local disk — download the YAML and commit it yourself, or ask to have `[github]` secrets set up so saves auto-deploy.
+"""
+    )
+
+
+def _render_properties_tab(properties: list) -> None:
+    from pipeline import property_writer
+
+    st.caption(
+        "Add a new property, or edit an existing one's basics — no YAML editing "
+        "required. Loan/JV abstracts still get added separately, once they exist."
+    )
+
+    if property_writer.github_configured():
+        st.success("GitHub connected — saved configs deploy automatically in ~2 min.", icon="✅")
+    else:
+        st.warning(
+            "GitHub not connected — configs save locally only, which won't persist on the "
+            "hosted app past the next redeploy. Add a `[github]` token + repo to this app's "
+            "Streamlit secrets to enable auto-deploy (same as ga-automation does), or use the "
+            "download button below and commit the file yourself.",
+            icon="⚠️",
+        )
+
+    codes = [c.property_code for c in properties]
+    names = {c.property_code: c.display() for c in properties}
+    edit_choice = st.selectbox(
+        "Edit existing or create new",
+        options=["+ Create new property"] + codes,
+        format_func=lambda c: c if c == "+ Create new property" else f"{names[c]}  ({c})",
+        key="prop_setup_edit_select",
+    )
+    is_new = edit_choice == "+ Create new property"
+    edit_cfg = None if is_new else next((p for p in properties if p.property_code == edit_choice), None)
+    # Every widget key below is suffixed with `edit_choice` — switching the edit
+    # target must force brand-new widgets, since Streamlit ignores a freshly
+    # computed `value=` on any widget whose key already has session state from
+    # a previous render (confirmed gotcha, see ga-automation's own CLAUDE.md).
+    ek = edit_choice
+
+    def ef(field, default=""):
+        if edit_cfg is None:
+            return default
+        return getattr(edit_cfg, field, default) or default
+
+    st.markdown("#### Basics")
+    col1, col2 = st.columns(2)
+    with col1:
+        property_code = st.text_input(
+            "Property Code (folder name — lowercase, no spaces)",
+            value="" if is_new else edit_cfg.property_code,
+            disabled=not is_new,
+            key=f"prop_code_{ek}",
+            help=None if is_new else "Can't be changed after creation — it's the data/<code>/ folder name.",
+        )
+        property_name = st.text_input("Legal Owning Entity", value=ef("property_name"), key=f"prop_name_{ek}")
+        property_display_name = st.text_input("Display Name (shown in the UI)", value=ef("property_display_name"), key=f"prop_display_{ek}")
+        property_address = st.text_input("Address", value=ef("property_address"), key=f"prop_address_{ek}")
+    with col2:
+        property_type = st.text_input("Property Type (e.g. Office, Life Science)", value=ef("property_type"), key=f"prop_type_{ek}")
+        market = st.text_input("Market", value=ef("market"), key=f"prop_market_{ek}")
+        submarket = st.text_input("Submarket", value=ef("submarket"), key=f"prop_submarket_{ek}")
+        state = st.text_input("State", value=ef("state"), key=f"prop_state_{ek}")
+    management_company = st.text_input(
+        "Management Company", value=ef("management_company", "Greatland Realty Partners"), key=f"prop_mgmt_{ek}"
+    )
+    active = st.checkbox("Active", value=True if edit_cfg is None else edit_cfg.active, key=f"prop_active_{ek}")
+
+    st.markdown("#### Yardi Entity Codes")
+    st.caption(
+        "The real Yardi export codes for this property's entities (property/venture/co-GP) — "
+        "used to filter multi-property source files down to this one. Comma-separated; often "
+        "differs from the Property Code above (confirmed for Revolution Labs: dashboard code "
+        "\"revlabspm\" vs. real Yardi codes \"revlabpm\"/\"revlabvn\"/\"bh1050jv\"/\"revlabs\")."
+    )
+    default_yardi = ", ".join(edit_cfg.yardi_codes) if edit_cfg else ""
+    yardi_codes_raw = st.text_input("Yardi Codes", value=default_yardi, key=f"prop_yardi_{ek}")
+    yardi_codes = [c.strip() for c in yardi_codes_raw.split(",") if c.strip()]
+
+    with st.expander("Distribution Workbook Tab Names (advanced)", expanded=False):
+        st.caption(
+            "Tab names inside the quarterly distribution workbook — only change these if this "
+            "property's workbook uses different tab names than the ones below."
+        )
+        existing_map = edit_cfg.sheet_map if edit_cfg and edit_cfg.sheet_map else {}
+        sheet_map = {}
+        for key, default_label in _TEMPLATE_SHEET_MAP.items():
+            sheet_map[key] = st.text_input(
+                key.replace("_", " ").title(), value=existing_map.get(key, default_label), key=f"prop_sheetmap_{key}_{ek}"
+            )
+
+    st.markdown("#### Ownership / JV Structure")
+    st.caption(
+        "One tier is enough for a simple LP/GP split. Multi-tier (co-GP) structures — like "
+        "Revolution Labs' own LP/GP + Co-GP split — aren't supported by this form yet; save "
+        "this as a single tier below, then edit config.yaml directly to add a nested tier."
+    )
+    top_tier = edit_cfg.top_level_tier() if edit_cfg else None
+    tier_label = st.text_input(
+        "Tier Label (shown as the Distribution Waterfall tab name)",
+        value=top_tier.label() if top_tier else "LP/GP",
+        key=f"prop_tier_label_{ek}",
+    )
+    tier_entity = st.text_input(
+        "Distributing Entity Name", value=top_tier.distributing_entity if top_tier else "", key=f"prop_tier_entity_{ek}"
+    )
+
+    if st.session_state.get("prop_investor_rows_for") != ek:
+        st.session_state.prop_investor_rows = [
+            {
+                "display_name": inv.display_name,
+                "legal_entity": inv.legal_entity,
+                "ownership_pct": inv.ownership_pct * 100,
+                "role": inv.role,
+            }
+            for inv in (top_tier.investors if top_tier else [])
+        ] or [{"display_name": "", "legal_entity": "", "ownership_pct": 0.0, "role": "LP"}]
+        st.session_state.prop_investor_rows_for = ek
+
+    st.markdown("**Investors**")
+    hdr1, hdr2, hdr3, hdr4, _hdr5 = st.columns([3, 3, 2, 2, 1])
+    hdr1.caption("Investor Name")
+    hdr2.caption("Legal Entity")
+    hdr3.caption("Ownership %")
+    hdr4.caption("Role")
+
+    row_to_remove = None
+    for i, row in enumerate(st.session_state.prop_investor_rows):
+        c1, c2, c3, c4, c5 = st.columns([3, 3, 2, 2, 1])
+        row["display_name"] = c1.text_input("Investor Name", value=row["display_name"], key=f"inv_name_{ek}_{i}", label_visibility="collapsed")
+        row["legal_entity"] = c2.text_input("Legal Entity", value=row["legal_entity"], key=f"inv_entity_{ek}_{i}", label_visibility="collapsed")
+        row["ownership_pct"] = c3.number_input("Ownership %", value=row["ownership_pct"], step=1.0, key=f"inv_pct_{ek}_{i}", label_visibility="collapsed")
+        role_idx = _ROLE_OPTIONS.index(row["role"]) if row["role"] in _ROLE_OPTIONS else 0
+        row["role"] = c4.selectbox("Role", _ROLE_OPTIONS, index=role_idx, key=f"inv_role_{ek}_{i}", label_visibility="collapsed")
+        if c5.button("✕", key=f"inv_remove_{ek}_{i}"):
+            row_to_remove = i
+    if row_to_remove is not None:
+        st.session_state.prop_investor_rows.pop(row_to_remove)
+        st.rerun()
+    if st.button("+ Add investor", key=f"prop_add_investor_{ek}"):
+        st.session_state.prop_investor_rows.append({"display_name": "", "legal_entity": "", "ownership_pct": 0.0, "role": "LP"})
+        st.rerun()
+
+    st.divider()
+    if st.button("Save Property", type="primary", key=f"prop_save_{ek}"):
+        code_clean = property_code.strip()
+        if not code_clean:
+            st.error("Property Code is required.")
+        elif is_new and code_clean in codes:
+            st.error(f'A property with code "{code_clean}" already exists.')
+        else:
+            investor_dicts = [
+                {
+                    "display_name": r["display_name"],
+                    "legal_entity": r["legal_entity"],
+                    "ownership_pct": r["ownership_pct"] / 100,
+                    "role": r["role"],
+                    "sub_tier": None,
+                }
+                for r in st.session_state.prop_investor_rows
+                if r["display_name"].strip()
+            ]
+            ownership_tiers = (
+                [
+                    {
+                        "tier_id": "property",
+                        "distributing_entity": tier_entity,
+                        "parent_tier": None,
+                        "display_label": tier_label,
+                        "investors": investor_dicts,
+                    }
+                ]
+                if investor_dicts
+                else []
+            )
+            # Loans/JV documents have no form fields (abstracts are a separate,
+            # later, one-time step) — carry forward whatever's already there
+            # when editing, rather than silently wiping them out on save.
+            loans = (
+                [{"tranche_name": l.tranche_name, "lender": l.lender, "abstract_file": l.abstract_file} for l in edit_cfg.loans]
+                if edit_cfg
+                else []
+            )
+            jv_documents = (
+                [{"name": d.name, "abstract_file": d.abstract_file} for d in edit_cfg.jv_documents] if edit_cfg else []
+            )
+
+            config_dict = property_writer.build_config_dict(
+                property_code=code_clean,
+                property_name=property_name,
+                property_display_name=property_display_name,
+                property_address=property_address,
+                property_type=property_type,
+                market=market,
+                submarket=submarket,
+                state=state,
+                management_company=management_company,
+                active=active,
+                sheet_map=sheet_map,
+                yardi_codes=yardi_codes,
+                ownership_tiers=ownership_tiers,
+                loans=loans,
+                jv_documents=jv_documents,
+            )
+            yaml_content = property_writer.config_to_yaml(config_dict)
+
+            local_ok, local_msg = property_writer.save_local(code_clean, yaml_content, str(DATA_DIR))
+            if local_ok:
+                st.success(f"Saved locally: {local_msg}")
+            else:
+                st.error(f"Local save failed: {local_msg}")
+
+            if property_writer.github_configured():
+                gh_ok, gh_msg = property_writer.save_to_github(code_clean, yaml_content)
+                (st.success if gh_ok else st.error)(gh_msg)
+
+            st.download_button(
+                "Download config.yaml",
+                data=yaml_content,
+                file_name=f"{code_clean}_config.yaml",
+                mime="text/yaml",
+                key=f"prop_download_{ek}",
+            )
+            if local_ok:
+                st.info("Switch tabs (or reload) to see it in the Active Property list.")
+
+
 def main() -> None:
     for key, default in {
         "selected_property": None,
@@ -242,10 +513,12 @@ def main() -> None:
 
     if not properties:
         render_hero("Deal Dashboard", "Greatland Realty Partners &mdash; Active Deal Tracking")
-        st.warning(
-            "No properties configured yet. Copy `data/TEMPLATE/config.yaml` to "
-            "`data/<property_code>/config.yaml` to add one."
-        )
+        st.info("No properties configured yet — add your first one in the **Properties** tab below.")
+        tab_howto_empty, tab_properties_empty = st.tabs(["How to Use", "Properties"])
+        with tab_howto_empty:
+            _render_how_to_use()
+        with tab_properties_empty:
+            _render_properties_tab(properties)
         return
 
     codes = [c.property_code for c in properties]
@@ -370,39 +643,12 @@ def main() -> None:
                     source_files.delete_period(cfg, reset_period, str(DATA_DIR))
                     st.rerun()
 
-    tab_howto, tab_portfolio, tab_detail = st.tabs(["How to Use", "Portfolio", "Property Detail"])
+    tab_howto, tab_portfolio, tab_detail, tab_properties = st.tabs(
+        ["How to Use", "Portfolio", "Property Detail", "Properties"]
+    )
 
     with tab_howto:
-        st.markdown(
-            """
-**Views** (the tabs above)
-- **Portfolio** — every active property, one row each, with headline cash/debt/distribution figures.
-- **Property Detail** — everything for the **Active Property** picked above. Pick a month/quarter from **Viewing Period** next to it.
-
-**Uploading files**
-Drop files into **Update Source Files** (sidebar) — each one is auto-detected by its content (not its filename), so you don't need to sort them first. Drop as many as you want at once. Recognized types: distribution workbook, trial balance (one file per entity — e.g. property, venture, co-GP), rent roll, Yardi Budget Comparison report, and loan servicer statement PDFs. A file is filed under whatever period it's dated as of — if a type isn't re-uploaded in a given month, the app shows the last known version instead of going blank.
-
-If a file gets rejected, the message right above the uploader explains why (usually "couldn't find an as-of date" or "doesn't look like any known file type") — it stays on screen until the next upload.
-
-**Removing a file** — open **Reset Source Files** (sidebar), pick the period, and either remove one file or clear the whole period. Each action needs you to type the exact file/period name first — deletes can't be undone from here.
-
-**Sections** (the pills below the property header, inside Property Detail)
-- **Summary** — the one-glance view: cash, NOI, debt, occupancy, with jump links into the detail sections.
-- **Cash** — every cash/escrow/reserve account, by source.
-- **Equity & Capital** — contributions, distributions, and capital balances per entity.
-- **Balance Sheet** — full balance sheet per entity, from the distribution workbook's equity tabs.
-- **Rent Roll** — occupancy, lease terms, current rent/CAM, and upcoming rent steps per suite.
-- **Debt & Loans** — forecast (distribution workbook) vs. actual (loan statements) balances and rates, side by side.
-- **Distribution Waterfall** — the JV distribution calc per ownership tier.
-- **Budget vs. Actuals** — two toggles: Period-to-Date (the selected month) vs. Year-to-Date, and Summary (P&L rollup, plus a BOMA-category OpEx breakdown) vs. Detailed (account-level). Year-to-Date also shows a Reforecast column (the distribution workbook's own current-year figure) alongside Kardin's once-per-year Annual Budget.
-- **Hold/Sell Assumptions** — see below.
-- **Sources & Uses** / **Leasing & Investment Outlook** — placeholders until the leasing/investment model is finalized.
-- **Reconciliation** — cross-checks each uploaded trial balance's own figures (AR/AP/mortgage/cash) against the other source files that should describe the same real-world numbers; flags anything off by more than a small tolerance (could just be a timing difference between files).
-
-**Hold/Sell Assumptions**
-This section holds the inputs for the property's hold/sell model (inflation, vacancy, market leasing terms, cap rate, hold period, refinance) so anyone can view or change them without opening Excel. **Save Assumptions** persists them for next time. **Download Excel Model** produces a fresh workbook with those assumptions plus the latest real data (rent roll, actuals, debt, equity) already filled in — all the actual math (rollover schedule, debt amortization, IRR) lives in that workbook's own formulas, not in the app, so the exported file is always the authoritative calculation.
-"""
-        )
+        _render_how_to_use()
 
     with tab_portfolio:
         rows = []
@@ -512,6 +758,9 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
                 cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR),
                 opex_categories, boma_opex,
             )
+
+    with tab_properties:
+        _render_properties_tab(properties)
 
 
 if not check_password():
