@@ -269,7 +269,7 @@ If a file gets rejected, the message right above the uploader explains why (usua
 This section holds the inputs for the property's hold/sell model (inflation, vacancy, market leasing terms, cap rate, hold period, refinance) so anyone can view or change them without opening Excel. **Save Assumptions** persists them for next time. **Download Excel Model** produces a fresh workbook with those assumptions plus the latest real data (rent roll, actuals, debt, equity) already filled in — all the actual math (rollover schedule, debt amortization, IRR) lives in that workbook's own formulas, not in the app, so the exported file is always the authoritative calculation.
 
 **Adding a property**
-Use the **Properties** tab: fill in the basics, Yardi entity codes, and (optionally) a single ownership tier with its investors, then **Save Property**. If GitHub isn't connected (see the banner at the top of that tab), the config only saves to this machine's local disk — download the YAML and commit it yourself, or ask to have `[github]` secrets set up so saves auto-deploy.
+Use the **Properties** tab: fill in the basics, upload a hero photo, Yardi entity codes, and (optionally) a single ownership tier with its investors, then **Save Property**. If GitHub isn't connected (see the banner at the top of that tab), everything only saves to this machine's local disk — download the YAML and commit it (plus the photo) yourself, or ask to have `[github]` secrets set up so saves auto-deploy.
 """
     )
 
@@ -336,6 +336,24 @@ def _render_properties_tab(properties: list) -> None:
         "Management Company", value=ef("management_company", "Greatland Realty Partners"), key=f"prop_mgmt_{ek}"
     )
     active = st.checkbox("Active", value=True if edit_cfg is None else edit_cfg.active, key=f"prop_active_{ek}")
+
+    st.markdown("#### Property Photo")
+    st.caption("Shown in the hero banner at the top of every page for this property. JPG, PNG, or WebP.")
+    assets_dir = str(APP_DIR / "assets")
+    existing_photo_path = None
+    if edit_cfg:
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            candidate = Path(assets_dir) / f"{edit_cfg.property_code}_hero{ext}"
+            if candidate.exists():
+                existing_photo_path = candidate
+                break
+    if existing_photo_path:
+        st.image(str(existing_photo_path), caption="Current photo", width=280)
+    photo_upload = st.file_uploader(
+        "Upload a new photo" if existing_photo_path else "Upload a photo",
+        type=["jpg", "jpeg", "png", "webp"],
+        key=f"prop_photo_{ek}",
+    )
 
     st.markdown("#### Yardi Entity Codes")
     st.caption(
@@ -484,6 +502,20 @@ def _render_properties_tab(properties: list) -> None:
             if property_writer.github_configured():
                 gh_ok, gh_msg = property_writer.save_to_github(code_clean, yaml_content)
                 (st.success if gh_ok else st.error)(gh_msg)
+
+            if photo_upload is not None:
+                photo_bytes = photo_upload.getvalue()
+                photo_ext = "." + photo_upload.name.rsplit(".", 1)[-1].lower()
+                photo_local_ok, photo_local_msg = property_writer.save_hero_photo_local(
+                    code_clean, photo_bytes, photo_ext, assets_dir
+                )
+                if photo_local_ok:
+                    st.success(f"Photo saved locally: {photo_local_msg}")
+                else:
+                    st.error(f"Photo local save failed: {photo_local_msg}")
+                if property_writer.github_configured():
+                    photo_gh_ok, photo_gh_msg = property_writer.save_hero_photo_to_github(code_clean, photo_bytes, photo_ext)
+                    (st.success if photo_gh_ok else st.error)(photo_gh_msg)
 
             st.download_button(
                 "Download config.yaml",

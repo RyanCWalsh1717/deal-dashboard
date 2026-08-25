@@ -91,6 +91,80 @@ def save_local(property_code: str, yaml_content: str, data_dir: str) -> Tuple[bo
         return False, str(e)
 
 
+_HERO_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def save_hero_photo_local(property_code: str, image_bytes: bytes, ext: str, assets_dir: str) -> Tuple[bool, str]:
+    """Saves a property's hero photo to assets/{property_code}_hero{ext} — the
+    exact filename views/branding.py's _hero_photo_src() looks for (unlike
+    ga-automation's own save_image_local(), which writes under data/<code>/;
+    Deal Dashboard's hero photos have always lived in a flat assets/ folder,
+    see e.g. assets/revlabspm_hero.jpg). Deletes any OTHER extension's hero
+    file for this property first, so an old photo can't keep winning
+    _hero_photo_src()'s fixed jpg→jpeg→png→webp search order after it's
+    been replaced with a different format."""
+    try:
+        folder = os.path.join(assets_dir)
+        os.makedirs(folder, exist_ok=True)
+        for other_ext in _HERO_EXTS:
+            if other_ext != ext:
+                stale = os.path.join(folder, f"{property_code}_hero{other_ext}")
+                if os.path.exists(stale):
+                    os.remove(stale)
+        path = os.path.join(folder, f"{property_code}_hero{ext}")
+        with open(path, "wb") as f:
+            f.write(image_bytes)
+        return True, path
+    except Exception as e:
+        return False, str(e)
+
+
+def save_hero_photo_to_github(property_code: str, image_bytes: bytes, ext: str) -> Tuple[bool, str]:
+    """Uploads a property's hero photo to assets/{property_code}_hero{ext} in
+    the GitHub repo. Doesn't delete other-extension files in GitHub (the
+    contents API only writes/updates one path at a time) — a stale photo left
+    behind there after a format change is a minor, self-resolving cosmetic
+    gap, not a correctness issue, since the local save above already prevents
+    it for local runs."""
+    import base64
+
+    try:
+        import requests
+    except ImportError:
+        return False, "requests library not available"
+
+    token, repo = _github_credentials()
+    if not token or not repo:
+        return False, "GitHub token/repo not configured in secrets"
+
+    path = f"assets/{property_code}_hero{ext}"
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+    sha = None
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+    except Exception:
+        pass
+
+    payload: dict = {
+        "message": f"Upload hero photo: {property_code}_hero{ext}",
+        "content": base64.b64encode(image_bytes).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        r = requests.put(url, json=payload, headers=headers, timeout=30)
+        if r.status_code in (200, 201):
+            return True, "Photo saved to GitHub. Hero banner updates after ~2 min redeploy."
+        return False, f"GitHub API returned {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _github_credentials() -> Tuple[str, str]:
     """Returns (token, repo) from Streamlit secrets or environment variables,
     or ('', '') if neither is configured."""
