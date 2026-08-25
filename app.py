@@ -239,29 +239,49 @@ def main() -> None:
     st.sidebar.markdown(
         "<h2 style='color:#1A5C22;'>Deal Dashboard</h2>", unsafe_allow_html=True
     )
-    view = st.sidebar.radio("View", ["Portfolio", "Property Detail"])
 
     if not properties:
+        render_hero("Deal Dashboard", "Greatland Realty Partners &mdash; Active Deal Tracking")
         st.warning(
             "No properties configured yet. Copy `data/TEMPLATE/config.yaml` to "
             "`data/<property_code>/config.yaml` to add one."
         )
         return
 
-    if view == "Portfolio":
-        rows = []
-        for cfg in properties:
-            periods = source_files.list_periods(cfg, str(DATA_DIR))
-            latest_period = periods[0] if periods else None
-            path, mtime = _resolve_workbook_path(cfg, latest_period)
-            result = _cached_parse(str(path), mtime, cfg.property_code, str(DATA_DIR)) if path else None
-            rows.append(_build_portfolio_row(cfg, result))
-        render_portfolio(rows)
-        return
-
     codes = [c.property_code for c in properties]
     names = {c.property_code: c.display() for c in properties}
-    selected_code = st.sidebar.selectbox("Property", codes, format_func=lambda c: names[c])
+
+    # Active property persists per-browser via the URL's ?property= query param —
+    # so the app reopens on whatever each person was last looking at, and a
+    # property is linkable/bookmarkable. Falls back to the first property if the
+    # URL has nothing (or something stale, e.g. a deleted property).
+    if "active_property_code" not in st.session_state:
+        qp_code = st.query_params.get("property")
+        st.session_state.active_property_code = qp_code if qp_code in codes else codes[0]
+    if st.session_state.active_property_code not in codes:
+        st.session_state.active_property_code = codes[0]
+
+    cfg = next(c for c in properties if c.property_code == st.session_state.active_property_code)
+    badges = [b for b in [cfg.market, cfg.property_type] if b]
+    render_hero(cfg.display(), cfg.property_address, badges, photo_code=cfg.property_code)
+
+    sel_col, period_col, _spacer_col = st.columns([2, 2, 4])
+    with sel_col:
+        selected_code = st.selectbox(
+            "Active Property",
+            codes,
+            index=codes.index(st.session_state.active_property_code),
+            format_func=lambda c: names[c],
+            key="active_property_selectbox",
+        )
+        if selected_code != st.session_state.active_property_code:
+            st.session_state.active_property_code = selected_code
+            st.query_params["property"] = selected_code
+            st.rerun()
+    if st.query_params.get("property") != st.session_state.active_property_code:
+        st.query_params["property"] = st.session_state.active_property_code
+
+    selected_code = st.session_state.active_property_code
     cfg = next(c for c in properties if c.property_code == selected_code)
 
     period_key = f"period_select_{selected_code}"
@@ -270,10 +290,13 @@ def main() -> None:
 
     periods = source_files.list_periods(cfg, str(DATA_DIR))
     selected_period = None
-    if periods:
-        if period_key not in st.session_state or st.session_state[period_key] not in periods:
-            st.session_state[period_key] = periods[0]
-        selected_period = st.sidebar.selectbox("Viewing Period", periods, key=period_key)
+    with period_col:
+        if periods:
+            if period_key not in st.session_state or st.session_state[period_key] not in periods:
+                st.session_state[period_key] = periods[0]
+            selected_period = st.selectbox("Viewing Period", periods, key=period_key)
+        else:
+            st.selectbox("Viewing Period", ["No periods yet"], disabled=True)
 
     st.sidebar.markdown("---")
     with st.sidebar.expander("Update Source Files"):
@@ -347,21 +370,23 @@ def main() -> None:
                     source_files.delete_period(cfg, reset_period, str(DATA_DIR))
                     st.rerun()
 
-    with st.sidebar.expander("How to Use"):
+    tab_howto, tab_portfolio, tab_detail = st.tabs(["How to Use", "Portfolio", "Property Detail"])
+
+    with tab_howto:
         st.markdown(
             """
-**Views**
+**Views** (the tabs above)
 - **Portfolio** — every active property, one row each, with headline cash/debt/distribution figures.
-- **Property Detail** — everything for one property. Pick it from the **Property** dropdown, then pick a month/quarter from **Viewing Period**.
+- **Property Detail** — everything for the **Active Property** picked above. Pick a month/quarter from **Viewing Period** next to it.
 
 **Uploading files**
-Drop files into **Update Source Files** — each one is auto-detected by its content (not its filename), so you don't need to sort them first. Drop as many as you want at once. Recognized types: distribution workbook, trial balance (one file per entity — e.g. property, venture, co-GP), rent roll, Yardi Budget Comparison report, and loan servicer statement PDFs. A file is filed under whatever period it's dated as of — if a type isn't re-uploaded in a given month, the app shows the last known version instead of going blank.
+Drop files into **Update Source Files** (sidebar) — each one is auto-detected by its content (not its filename), so you don't need to sort them first. Drop as many as you want at once. Recognized types: distribution workbook, trial balance (one file per entity — e.g. property, venture, co-GP), rent roll, Yardi Budget Comparison report, and loan servicer statement PDFs. A file is filed under whatever period it's dated as of — if a type isn't re-uploaded in a given month, the app shows the last known version instead of going blank.
 
 If a file gets rejected, the message right above the uploader explains why (usually "couldn't find an as-of date" or "doesn't look like any known file type") — it stays on screen until the next upload.
 
-**Removing a file** — open **Reset Source Files**, pick the period, and either remove one file or clear the whole period. Each action needs you to type the exact file/period name first — deletes can't be undone from here.
+**Removing a file** — open **Reset Source Files** (sidebar), pick the period, and either remove one file or clear the whole period. Each action needs you to type the exact file/period name first — deletes can't be undone from here.
 
-**Sections** (the pills below the property header)
+**Sections** (the pills below the property header, inside Property Detail)
 - **Summary** — the one-glance view: cash, NOI, debt, occupancy, with jump links into the detail sections.
 - **Cash** — every cash/escrow/reserve account, by source.
 - **Equity & Capital** — contributions, distributions, and capital balances per entity.
@@ -379,104 +404,114 @@ This section holds the inputs for the property's hold/sell model (inflation, vac
 """
         )
 
-    if not periods:
-        st.info(
-            f"No source files yet for **{cfg.display()}**. Use “Update Source Files” "
-            "in the sidebar to upload the distribution workbook, trial balance, rent roll, "
-            "and/or loan statements."
-        )
-        return
+    with tab_portfolio:
+        rows = []
+        for p_cfg in properties:
+            p_periods = source_files.list_periods(p_cfg, str(DATA_DIR))
+            latest_period = p_periods[0] if p_periods else None
+            p_path, p_mtime = _resolve_workbook_path(p_cfg, latest_period)
+            p_result = _cached_parse(str(p_path), p_mtime, p_cfg.property_code, str(DATA_DIR)) if p_path else None
+            rows.append(_build_portfolio_row(p_cfg, p_result))
+        render_portfolio(rows)
 
-    path, mtime = _resolve_workbook_path(cfg, selected_period)
-    result = None
-    if path is None:
-        st.info(f"No distribution workbook found for **{cfg.display()}** as of {selected_period}.")
-    else:
-        try:
-            result = _cached_parse(str(path), mtime, cfg.property_code, str(DATA_DIR))
-        except Exception as exc:
-            st.error(f"Failed to parse workbook: {exc}")
+    with tab_detail:
+        if not periods:
+            st.info(
+                f"No source files yet for **{cfg.display()}**. Use “Update Source Files” "
+                "in the sidebar to upload the distribution workbook, trial balance, rent roll, "
+                "and/or loan statements."
+            )
+        else:
+            path, mtime = _resolve_workbook_path(cfg, selected_period)
+            result = None
+            if path is None:
+                st.info(f"No distribution workbook found for **{cfg.display()}** as of {selected_period}.")
+            else:
+                try:
+                    result = _cached_parse(str(path), mtime, cfg.property_code, str(DATA_DIR))
+                except Exception as exc:
+                    st.error(f"Failed to parse workbook: {exc}")
 
-    opex_categories: dict = {}
-    boma_opex: dict = {}
-    if result is not None:
-        bc_path, bc_mtime = _resolve_budget_comparison_path(cfg, selected_period)
-        if bc_path is not None:
-            try:
-                bc_result = _cached_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
-                if bc_result.lines:
-                    result.budget_comparison = bc_result
+            opex_categories: dict = {}
+            boma_opex: dict = {}
+            if result is not None:
+                bc_path, bc_mtime = _resolve_budget_comparison_path(cfg, selected_period)
+                if bc_path is not None:
+                    try:
+                        bc_result = _cached_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
+                        if bc_result.lines:
+                            result.budget_comparison = bc_result
 
-                annual_totals = _cached_annual_budget_totals(str(bc_path), bc_mtime)
-                if len(annual_totals) == 8 and result.annual_budget_summary:
-                    result.annual_budget_summary.lines = [
-                        BudgetLine(
-                            account_code=line.account_code,
-                            account_label=line.account_label,
-                            # Kardin's static once-per-year budget replaces budget_value; the
-                            # distribution workbook's own figure it displaces is kept as the
-                            # live reforecast, not discarded.
-                            budget_value=annual_totals.get(line.account_code, line.budget_value),
-                            actual_value=line.actual_value,
-                            reforecast_value=line.budget_value,
-                        )
-                        for line in result.annual_budget_summary.lines
-                    ]
+                        annual_totals = _cached_annual_budget_totals(str(bc_path), bc_mtime)
+                        if len(annual_totals) == 8 and result.annual_budget_summary:
+                            result.annual_budget_summary.lines = [
+                                BudgetLine(
+                                    account_code=line.account_code,
+                                    account_label=line.account_label,
+                                    # Kardin's static once-per-year budget replaces budget_value; the
+                                    # distribution workbook's own figure it displaces is kept as the
+                                    # live reforecast, not discarded.
+                                    budget_value=annual_totals.get(line.account_code, line.budget_value),
+                                    actual_value=line.actual_value,
+                                    reforecast_value=line.budget_value,
+                                )
+                                for line in result.annual_budget_summary.lines
+                            ]
 
-                ytd_detail = _cached_ytd_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
-                if ytd_detail.lines:
-                    result.annual_budget_detail = ytd_detail
+                        ytd_detail = _cached_ytd_budget_comparison_report(str(bc_path), bc_mtime, cfg.property_code)
+                        if ytd_detail.lines:
+                            result.annual_budget_detail = ytd_detail
 
-                opex_categories = _cached_opex_categories(str(bc_path), bc_mtime)
-                boma_opex = {
-                    "ptd": {
-                        "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_ACTUAL_COL)),
-                        "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_BUDGET_COL)),
-                    },
-                    "ytd": {
-                        "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_ACTUAL_COL)),
-                        "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_BUDGET_COL)),
-                    },
-                }
-            except Exception as exc:
-                st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
+                        opex_categories = _cached_opex_categories(str(bc_path), bc_mtime)
+                        boma_opex = {
+                            "ptd": {
+                                "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_ACTUAL_COL)),
+                                "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, PTD_BUDGET_COL)),
+                            },
+                            "ytd": {
+                                "actual": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_ACTUAL_COL)),
+                                "budget": boma_rollup(_cached_opex_categories(str(bc_path), bc_mtime, YTD_BUDGET_COL)),
+                            },
+                        }
+                    except Exception as exc:
+                        st.error(f"Failed to parse budget comparison report ({Path(bc_path).name}): {exc}")
 
-    entity_trial_balances = []
-    for path_str, tb_mtime in _discover_trial_balance_paths(cfg, selected_period).items():
-        try:
-            entity_trial_balances.extend(_cached_entity_trial_balance(path_str, tb_mtime, tuple(cfg.yardi_codes)))
-        except Exception as exc:
-            st.error(f"Failed to parse trial balance ({Path(path_str).name}): {exc}")
+            entity_trial_balances = []
+            for path_str, tb_mtime in _discover_trial_balance_paths(cfg, selected_period).items():
+                try:
+                    entity_trial_balances.extend(_cached_entity_trial_balance(path_str, tb_mtime, tuple(cfg.yardi_codes)))
+                except Exception as exc:
+                    st.error(f"Failed to parse trial balance ({Path(path_str).name}): {exc}")
 
-    cash_accounts = [acct for entity in entity_trial_balances for acct in entity.cash_accounts]
+            cash_accounts = [acct for entity in entity_trial_balances for acct in entity.cash_accounts]
 
-    loan_statements = []
-    for path_str, ls_mtime in _discover_loan_statement_paths(cfg, selected_period).items():
-        try:
-            stmt = _cached_loan_statement(path_str, ls_mtime)
-            if stmt:
-                loan_statements.append(stmt)
-        except Exception as exc:
-            st.error(f"Failed to parse loan statement ({Path(path_str).name}): {exc}")
+            loan_statements = []
+            for path_str, ls_mtime in _discover_loan_statement_paths(cfg, selected_period).items():
+                try:
+                    stmt = _cached_loan_statement(path_str, ls_mtime)
+                    if stmt:
+                        loan_statements.append(stmt)
+                except Exception as exc:
+                    st.error(f"Failed to parse loan statement ({Path(path_str).name}): {exc}")
 
-    if not cash_accounts and loan_statements:
-        from pipeline.parsers.cash_accounts import loan_statement_cash_accounts
+            if not cash_accounts and loan_statements:
+                from pipeline.parsers.cash_accounts import loan_statement_cash_accounts
 
-        for stmt in loan_statements:
-            cash_accounts.extend(loan_statement_cash_accounts(stmt))
+                for stmt in loan_statements:
+                    cash_accounts.extend(loan_statement_cash_accounts(stmt))
 
-    rr_path, rr_mtime = _resolve_rent_roll_path(cfg, selected_period)
-    rent_roll = None
-    if rr_path is not None:
-        try:
-            rent_roll = _cached_rent_roll(str(rr_path), rr_mtime, cfg.property_code)
-        except Exception as exc:
-            st.error(f"Failed to parse rent roll: {exc}")
+            rr_path, rr_mtime = _resolve_rent_roll_path(cfg, selected_period)
+            rent_roll = None
+            if rr_path is not None:
+                try:
+                    rent_roll = _cached_rent_roll(str(rr_path), rr_mtime, cfg.property_code)
+                except Exception as exc:
+                    st.error(f"Failed to parse rent roll: {exc}")
 
-    render_property_detail(
-        cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR),
-        opex_categories, boma_opex,
-    )
+            render_property_detail(
+                cfg, result, cash_accounts, rent_roll, loan_statements, entity_trial_balances, str(DATA_DIR),
+                opex_categories, boma_opex,
+            )
 
 
 if not check_password():

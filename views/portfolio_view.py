@@ -8,7 +8,6 @@ import pandas as pd
 import streamlit as st
 
 from pipeline.models import PortfolioSummaryRow
-from views.branding import render_hero
 
 
 def _fmt_money(v):
@@ -16,9 +15,6 @@ def _fmt_money(v):
 
 
 def render_portfolio(rows: List[PortfolioSummaryRow]) -> None:
-    render_hero("Portfolio", "Greatland Realty Partners &mdash; All Properties")
-    st.write("")
-
     if not rows:
         st.info("No properties to show.")
         return

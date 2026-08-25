@@ -26,7 +26,7 @@ from pipeline import holdsell_model
 from pipeline.parsers.abstract_loader import load_jv_abstract, load_loan_abstract
 from pipeline.parsers.budget_comparison_report import BOMA_CATEGORY_ORDER
 from pipeline.property_config import PropertyConfig
-from views.branding import render_hero, render_kpi_tiles
+from views.branding import render_kpi_tiles
 
 
 def _fmt_money(v):
@@ -182,10 +182,6 @@ def render_property_detail(
     entity_trial_balances = entity_trial_balances or []
     opex_categories = opex_categories or {}
     boma_opex = boma_opex or {}
-
-    badges = [b for b in [cfg.market, cfg.property_type] if b]
-    render_hero(cfg.display(), cfg.property_address, badges, photo_code=cfg.property_code)
-    st.write("")
 
     # Apply any pending nav request (from a Summary jump button) before either
     # segmented_control widget below is instantiated this run.
